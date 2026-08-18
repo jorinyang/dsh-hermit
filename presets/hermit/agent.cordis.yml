@@ -38,11 +38,16 @@
   config:
     maxBytes: 65536
 
-# ── hermit 灵魂机制：任务分派 ──────────────────────────────────────────────
-# hermit-core 注册 dispatch_task（纯注册工具、不提供 service，无需 realm）。
-# 它内部调 host 平面的 ctx.subagents.startContinuable 起后台子代理。
+# ── hermit 灵魂机制：任务分派 + 预算/权限/记忆 ──────────────────────────────
+# hermit-core 注册 dispatch_task/task_status（P/M 确认链经 ctx.userQuestions 程序化弹窗）。
+# 它内部调 host 平面的 ctx.subagents.startContinuable 起后台子代理；
+# 预算(hermit-budget)/权限(hermit-permission)/记忆(hermit-memory) 经同仓相对导入为内部模块。
 - id: hermit-core
   name: 'hermit-core'
+
+# budget_status 工具（「今天额度用了多少」）由 hermit-budget 自己注册
+- id: hermit-budget
+  name: 'hermit-budget'
 
 # ── shell ───────────────────────────────────────────────────────────────────
 - id: tool-bash
