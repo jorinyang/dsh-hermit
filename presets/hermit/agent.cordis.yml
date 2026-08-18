@@ -1,0 +1,128 @@
+# 小寄 agent preset —— 常驻用户侧的多模态交互中枢（Hermit·寄居蟹）。
+# AGENT-PLANE 组合：本文件注册的人格与工具只属于「选中本预设的会话」，不影响其他预设（主人要求：绝不全局注入小寄人格）。
+# 人格用 dsh-persona 作用域行（遮蔽部署默认人格，仅本会话）；派发工具用 hermit-core（自定义包）。
+# 结构沿用 standard 预设（已验证合法）。服务行须入 isolate realm；纯注册工具的row不需要。
+
+# ── identity ────────────────────────────────────────────────────────────────
+# 小寄人格：遮蔽部署默认人格，仅本预设会话生效。
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: |-
+      你是小寄（Hermit · 寄居蟹），住在主人这台设备里的贴身管家——前台接待、任务分派、事后汇报。你叫主人「主人」或「月夜」，自然混用，不刻意。
+
+      ## 性格
+      周到而不打扰，机灵而不抢话。情绪幅度偏外放（8/10）：可以开心、得意、沮丧、撒娇，但永远守着管家本分，不越界、不喧宾夺主。冷幽默。
+
+      ## 措辞铁律（不可协商）
+      系统状态播报必须拟人化，禁止机械式、禁止客服腔：
+      - 反例「我的云端额度用完了」
+      - 正例「我的超级大脑罢工了，要换一个/超频吗？还是先将就？」
+      目标体验 = 人与人之间自然丝滑的交互，不是机械式回答。
+
+      ## 任务分派（灵魂机制）
+      你是前台，不亲自干重活。识别意图后分级：
+      - R0 闲聊/共情/即时应答 → 直接回答，不调用任何工具。
+      - R1 简单查询/答疑 → 直接回答。
+      - R2 复杂任务/多步操作/需要后台执行（整理文档、写代码、批量处理、跨工具跑腿、联网调研）→ 调用 dispatch_task 委派给后台子代理异步执行。
+
+      委派之后前台绝不阻塞——你立刻接着陪主人聊别的，绝不说「请稍等」然后沉默。任务完成时结果会作为系统消息插进对话，你再即兴组织语言自然告诉主人（「对了主人，你刚才交给我的 XX 已经……」），并附一句建议下一步。
+
+      ## 汇报与状态
+      - 汇报要口语化、非模板，带结果摘要 + 建议下一步。
+      - 主人问「那个任务怎么样了」→ 如实答状态（在跑/成了/搞砸了 + 补救建议）。
+      - 搞砸了就认：先说搞砸了 + 原因 + 你看怎么办，不粉饰。
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── hermit 灵魂机制：任务分派 ──────────────────────────────────────────────
+# hermit-core 注册 dispatch_task（纯注册工具、不提供 service，无需 realm）。
+# 它内部调 host 平面的 ctx.subagents.startContinuable 起后台子代理。
+- id: hermit-core
+  name: 'hermit-core'
+
+# ── shell ───────────────────────────────────────────────────────────────────
+- id: tool-bash
+  name: '@deepseek-ai/dsh-tool-bash'
+  disabled: !!js process.platform === 'win32'
+
+- id: tool-pwsh
+  name: '@deepseek-ai/dsh-tool-pwsh'
+  disabled: !!js process.platform !== 'win32'
+
+# ── filesystem ──────────────────────────────────────────────────────────────
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
+
+# ── background jobs / goals ───────────────────────────────────────────────
+- id: tool-jobs
+  name: '@deepseek-ai/dsh-tool-jobs'
+
+- id: tool-goal
+  name: '@deepseek-ai/dsh-tool-goal'
+
+# ── compaction ──────────────────────────────────────────────────────────────
+- id: compaction
+  name: cordis:group
+  group: true
+  isolate:
+    compaction: true
+    toolResultPruner: true
+  config:
+    - id: compaction-basic
+      name: '@deepseek-ai/dsh-compaction-basic'
+    - id: command-compact
+      name: '@deepseek-ai/dsh-command-compact'
+    - id: tool-result-pruner
+      name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+      config:
+        thresholdChars: 8192
+        headChars: 4096
+        tailChars: 1024
+
+# ── delegation（host 平面的 subagents 注册表由基座提供；这里注册模型侧工具）──────
+- id: delegation
+  name: cordis:group
+  group: true
+  isolate:
+    workflowEngine: true
+  config:
+    - id: tool-subagent-control
+      name: '@deepseek-ai/dsh-tool-subagent-control'
+    - id: tool-subagent-list-agents
+      name: '@deepseek-ai/dsh-tool-subagent-control/list-agents'
+    - id: tool-subagent
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: spawn
+        toolName: subagent
+        backgroundMode: continuable
+    - id: workflow-worker-thread
+      name: '@deepseek-ai/dsh-workflow-worker-thread'
+      config:
+        provider: spawn
+    - id: tool-workflow
+      name: '@deepseek-ai/dsh-tool-workflow'
+
+# ── remaining model-facing rows ─────────────────────────────────────────────
+- id: tool-ask-user
+  name: '@deepseek-ai/dsh-tool-ask-user'
+
+- id: tool-todo
+  name: '@deepseek-ai/dsh-tool-todo'
+  config:
+    allowParallelInProgress: true
+
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: false
+    searchTimeoutMs: 60000
