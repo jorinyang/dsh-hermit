@@ -1,0 +1,4 @@
+- insert:
+    - id: hermit-budget
+      name: hermit-budget
+      config: {}

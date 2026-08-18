@@ -1,0 +1,4 @@
+- insert:
+    - id: hermit-core
+      name: hermit-core
+      config: {}

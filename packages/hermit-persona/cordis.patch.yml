@@ -1,0 +1,4 @@
+- insert:
+    - id: hermit-persona
+      name: hermit-persona
+      config: {}

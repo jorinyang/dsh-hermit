@@ -1,0 +1,4 @@
+- insert:
+    - id: hermit-client-pet
+      name: hermit-client-pet
+      config: {}

@@ -1,0 +1,12 @@
+{
+  "name": "hermit",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Hermit (小寄) — 常驻用户侧的多模态交互中枢，基于 DSH 插件组合实现",
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test"
+  }
+}

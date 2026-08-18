@@ -1,0 +1,4 @@
+- insert:
+    - id: hermit-memory
+      name: hermit-memory
+      config: {}

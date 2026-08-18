@@ -1,0 +1,21 @@
+# providers.yaml — 云端 provider 配置（03 §2.4 Provider 配置 Schema）
+# 密钥一律走环境变量引用，永不硬编码（A8 隐私铁律 / 03 §7.3）
+providers:
+  - name: deepseek
+    type: api                    # api（按量计费）| token_plan（套餐制）
+    base_url: "https://api.deepseek.com"
+    api_key: "${DEEPSEEK_API_KEY}"
+    models: ["deepseek-chat", "deepseek-reasoner"]
+    usage_query:
+      enabled: true
+      method: api_key
+      endpoint: "/user/balance"
+  - name: kimi
+    type: api
+    base_url: "https://api.moonshot.cn"
+    api_key: "${MOONSHOT_API_KEY}"
+    models: ["kimi-k2", "kimi-k2-thinking"]
+    usage_query:
+      enabled: true
+      method: api_key
+      endpoint: "/v1/users/me/balance"

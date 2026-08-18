@@ -1,0 +1,5 @@
+{
+  "_comment": "模型×推理档位映射（08 §三）。控制形态 A=参数档位/B=开关+预算/C=模型名区分。热更新。",
+  "deepseek": { "form": "C", "L0": "deepseek-chat", "L1": "deepseek-chat", "L2": "deepseek-reasoner", "L3": "deepseek-reasoner" },
+  "kimi": { "form": "C", "L0": "kimi-k2", "L1": "kimi-k2", "L2": "kimi-k2-thinking", "L3": "kimi-k2-thinking" }
+}

@@ -1,0 +1,4 @@
+- insert:
+    - id: hermit-executors
+      name: hermit-executors
+      config: {}

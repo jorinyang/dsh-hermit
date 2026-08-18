@@ -1,0 +1,16 @@
+# pricing.yaml — credit 费率表（13 §一；provider×模型×推理档位 → credit，手工维护+开工实测回填）
+credit_anchor: { l0_input_per_1k: 1.0, l0_output_per_1k: 1.0 }   # 1 credit ≈ L0 档 1K tokens 综合均价
+budget:
+  daily_credits: 500        # 日闸（13 §二）
+  monthly_credits: 8000     # 月闸
+  appeal_per_day: 3         # 申诉弹性额度（01 §五）
+  warn_watermark: 0.80      # 水位预警（剩 20%）
+  critical_watermark: 0.95  # 再预警（剩 5%）
+rates:
+  deepseek:
+    deepseek-chat:     { L0: {in: 1.0, out: 1.0}, L1: {in: 2.0, out: 4.0}, L2: {in: 5.0, out: 10.0}, L3: {in: 10.0, out: 30.0} }
+    deepseek-reasoner: { L2: {in: 5.0, out: 10.0}, L3: {in: 10.0, out: 30.0} }
+  kimi:
+    kimi-k2:           { L0: {in: 1.0, out: 1.0}, L1: {in: 2.0, out: 4.0} }
+    kimi-k2-thinking:  { L2: {in: 5.0, out: 10.0}, L3: {in: 10.0, out: 30.0} }
+# TODO(回填): 开工时按当时 provider 实际定价实测修正（13 §一「静态值会过期」）
