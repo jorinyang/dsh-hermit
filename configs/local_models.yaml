@@ -1,0 +1,13 @@
+# local_models.yaml — 本地推理服务配置（02 模型选型；llama.cpp server OpenAI 兼容，外部进程）
+# hermit-executors 通过 HTTP 调用；显存调度（03 §4.4）由 SHC/HealthService 管理（MVP-1+）
+server:
+  base_url: "http://127.0.0.1:8080/v1"   # 仅绑定回环（03 §7.1）
+  runtime: llama.cpp                       # Vulkan 构建 b10488（CUDA-13.3 为性能升级位）
+  openai_compatible: true
+models:
+  brain:                                   # R0/R2 大脑（MVP-0 先用云端，本地为隐私兜底）
+    file: models/Qwen3-8B-Q6_K.gguf
+    role: brain
+    vram_gb: 6.26
+    ctx_size: 32768
+  # 后续挂载（02）：r1=Qwen3.5-4B / asr=Fun-ASR-Nano / tts=Qwen3-TTS / vlm=Qwen3-VL-4B(按需)

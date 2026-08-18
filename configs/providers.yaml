@@ -1,21 +1,35 @@
-# providers.yaml — 云端 provider 配置（03 §2.4 Provider 配置 Schema）
-# 密钥一律走环境变量引用，永不硬编码（A8 隐私铁律 / 03 §7.3）
+# providers.yaml — Hermit provider 注册表（03 §2.4 Schema）
+# A8 隐私铁律：密钥绝不落盘。apiKeyEnv 只是「引用名」，指向 DSH 凭证库（~/.dsh/.credentials.yaml）或环境变量；
+#   运行期由 hermit-executors 注入 DSH credentials 服务解析（与 dsh-llm 同一来源）。
+# 架构注：R2-c 云端直连复用 DSH ctx.llm（5 个 provider 路由/凭证/baseURL 已在 DSH settings.yaml 配好），
+#   本表只声明 Hermit 特有元数据——计费类型 + usage_query 端点 + 档位映射挂 pricing.yaml / reasoning_map.json。
 providers:
-  - name: deepseek
-    type: api                    # api（按量计费）| token_plan（套餐制）
+  - name: deepseek              # 唯一按量计费 + 有公开 balance 端点
+    type: api                   # api（按量计费）| token_plan（套餐制）
+    api_key_env: DEEPSEEK_API_KEY
     base_url: "https://api.deepseek.com"
-    api_key: "${DEEPSEEK_API_KEY}"
     models: ["deepseek-chat", "deepseek-reasoner"]
     usage_query:
       enabled: true
       method: api_key
       endpoint: "/user/balance"
-  - name: kimi
-    type: api
-    base_url: "https://api.moonshot.cn"
-    api_key: "${MOONSHOT_API_KEY}"
-    models: ["kimi-k2", "kimi-k2-thinking"]
-    usage_query:
-      enabled: true
-      method: api_key
-      endpoint: "/v1/users/me/balance"
+  - name: kimi-coding           # Kimi For Coding 订阅（DSH 默认大脑 = k3）
+    type: token_plan            # 套餐制：不按量计费，用量走 ctx.tokenMeter 实测
+    api_key_env: KIMI_CODING_API_KEY
+    models: ["k3", "k3-256k", "kimi-for-coding", "kimi-for-coding-highspeed"]
+    usage_query: { enabled: false }   # 订阅制无 balance 端点
+  - name: zai-coding-cn         # GLM coding 订阅
+    type: token_plan
+    api_key_env: ZAI_CODING_CN_API_KEY
+    models: ["glm-4.7", "glm-5-turbo", "glm-5.1", "glm-5.2", "glm-5v-turbo"]
+    usage_query: { enabled: false }
+  - name: minimax-cn            # MiniMax 订阅
+    type: token_plan
+    api_key_env: MINIMAX_CN_API_KEY
+    models: ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-M3"]
+    usage_query: { enabled: false }
+  - name: xiaomi                # MiMo 订阅
+    type: token_plan
+    api_key_env: XIAOMI_API_KEY
+    models: ["mimo-v2-flash", "mimo-v2-omni", "mimo-v2-pro", "mimo-v2.5", "mimo-v2.5-pro", "mimo-v2.5-pro-ultraspeed"]
+    usage_query: { enabled: false }

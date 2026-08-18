@@ -4,3 +4,7 @@ lib/
 .DS_Store
 .env
 *.log
+# 大二进制不入库（git 只跟踪代码与配置）
+models/
+runtime/llama.cpp/
+runtime/*.zip

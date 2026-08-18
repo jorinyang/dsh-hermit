@@ -1,4 +1,5 @@
-# pricing.yaml — credit 费率表（13 §一；provider×模型×推理档位 → credit，手工维护+开工实测回填）
+# pricing.yaml — credit 费率表（13 §一；provider×模型×推理档位 → credit）
+# 初始值为估算占位，开工时按当时 provider 实际定价实测回填（13 §一「静态值会过期」）。
 credit_anchor: { l0_input_per_1k: 1.0, l0_output_per_1k: 1.0 }   # 1 credit ≈ L0 档 1K tokens 综合均价
 budget:
   daily_credits: 500        # 日闸（13 §二）
@@ -6,11 +7,19 @@ budget:
   appeal_per_day: 3         # 申诉弹性额度（01 §五）
   warn_watermark: 0.80      # 水位预警（剩 20%）
   critical_watermark: 0.95  # 再预警（剩 5%）
-rates:
+
+# type=api（按量计费）：credit 直接折算 token 成本
+rates_api:
   deepseek:
-    deepseek-chat:     { L0: {in: 1.0, out: 1.0}, L1: {in: 2.0, out: 4.0}, L2: {in: 5.0, out: 10.0}, L3: {in: 10.0, out: 30.0} }
-    deepseek-reasoner: { L2: {in: 5.0, out: 10.0}, L3: {in: 10.0, out: 30.0} }
-  kimi:
-    kimi-k2:           { L0: {in: 1.0, out: 1.0}, L1: {in: 2.0, out: 4.0} }
-    kimi-k2-thinking:  { L2: {in: 5.0, out: 10.0}, L3: {in: 10.0, out: 30.0} }
-# TODO(回填): 开工时按当时 provider 实际定价实测修正（13 §一「静态值会过期」）
+    deepseek-chat:     { L0: {in: 0.5, out: 1.0}, L1: {in: 1.0, out: 3.0}, L2: {in: 2.0, out: 8.0} }
+    deepseek-reasoner: { L2: {in: 2.0, out: 8.0}, L3: {in: 4.0, out: 16.0} }
+
+# type=token_plan（套餐制）：无边际金钱成本，但仍计「虚拟 credit」做用量预算（防暴走/公平）
+rates_token_plan_virtual:
+  kimi-coding:    { per_1k_tokens: 1.0 }   # 虚拟费率：预算计量用，非真实金额
+  zai-coding-cn:  { per_1k_tokens: 1.0 }
+  minimax-cn:     { per_1k_tokens: 1.0 }
+  xiaomi:         { per_1k_tokens: 1.0 }
+
+# 本地模型（llama.cpp）：不计现金预算（边际成本≈电费），仅记录调用量供容量规划（13 §一）
+local_models: { billable: false, track_usage_only: true }
