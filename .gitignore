@@ -1,5 +1,4 @@
 node_modules/
-lib/
 *.tsbuildinfo
 .DS_Store
 .env
@@ -8,3 +7,5 @@ lib/
 models/
 runtime/llama.cpp/
 runtime/*.zip
+# 注：当前插件为 plain JS 直接写在 lib/（无构建环节），lib/ 即源码必须入库；
+# 未来迁移 TS 构建后改为忽略 lib/、跟踪 src/。
