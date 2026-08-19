@@ -19,7 +19,7 @@ const MAX_LINES = 2000
 
 /** 追加一条 M1 事件（供 hermit-core 调用）。崩溃安全：单行 append。 */
 export function record(type, refId, brief, sentimentHint) {
-  try {
+      try {
     fs.mkdirSync(path.dirname(M1_FILE), { recursive: true })
     fs.appendFileSync(M1_FILE, JSON.stringify({ ts: Date.now(), type, ref_id: refId, brief: String(brief).slice(0, 200), sentiment_hint: sentimentHint }) + '\n', 'utf8')
     // 上限裁剪（防无限膨胀；丢最老）

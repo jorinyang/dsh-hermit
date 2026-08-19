@@ -6,17 +6,18 @@
  *   ⑤预算预扣（hold，日/月闸校验，超额分级拒绝）
  *   → startContinuable 起子代理 → M1 落 task_dispatched
  *   → subagent/end 完成态追踪 → 预算实结（settle 多退少补）→ M1 落 completed/failed
- * 依赖注入（A3）：budget/permission/memory 以同仓相对导入引入（preset 作用域内共享模块图）。
+ * 依赖注入（A3）：budget/permission/memory 经绝对 file:// 路径导入（绕开宿主 cwd 与相对路径几何差异）。
  * @module hermit-core
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
-// 同仓相对导入（monorepo 兄弟包；不能裸名 import——web profile 的 node_modules 只 link 了 hermit-core 自己）
-import { budgetApi } from '../../hermit-budget/lib/index.js'
-import { confirmHighRisk } from '../../hermit-permission/lib/index.js'
-import { record as m1 } from '../../hermit-memory/lib/index.js'
+// 绝对 file:// URL 导入兄弟包，消除宿主进程的解析几何不确定性
+import { budgetApi } from 'file:///C:/Users/Aorus/Desktop/DSH/plugins/hermit/packages/hermit-budget/lib/index.js'
+import { confirmHighRisk } from 'file:///C:/Users/Aorus/Desktop/DSH/plugins/hermit/packages/hermit-permission/lib/index.js'
+import { record as m1 } from 'file:///C:/Users/Aorus/Desktop/DSH/plugins/hermit/packages/hermit-memory/lib/index.js'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+
 
 export const name = 'hermit-core'
 export const inject = ['tools', 'subagents', 'userQuestions']
@@ -42,6 +43,10 @@ function prune(map) {
   for (const [k] of terminal.slice(0, entries.length - MAX_TASKS)) delete map[k]
   return map
 }
+
+function loadLedger() { try { return JSON.parse(fs.readFileSync(LEDGER_FILE, "utf8")) } catch { return { holds: {}, entries: [] } } }
+function spentOn(l, keyFn) { return l.entries.filter(e => e.kind === "settle").reduce((s, e) => s + (keyFn(e.ts) === keyFn() ? e.credits : 0), 0) }
+function monthKey(ts = Date.now()) { const d = new Date(ts); return d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") }
 
 export function apply(ctx) {
   const tasks = prune(loadTasks())
@@ -122,13 +127,38 @@ export function apply(ctx) {
         tasks[key] = { taskId, childId: String(start.childId), label, status: 'working',
           startedAt: Date.now(), perm, complexity: args.complexity ?? 'medium', hold: hold.credits }
         saveTasks(prune(tasks))
-        m1('task_dispatched', taskId, `「${label}」${perm}级/${args.complexity ?? 'medium'}复杂度，预扣${hold.credits}c`)
+                try { m1('task_dispatched', taskId, `「${label}」${perm}级/${args.complexity ?? 'medium'}复杂度，预扣${hold.credits}c`) } catch (e) {  }
         return { ok: true, route: 'R2-a', task_id: taskId, status: 'dispatched',
           summary: `已接单，「${label}」后台开始办了，好了我告诉你。`, error: '' }
       } catch (e) {
         budget.release(key)
         return fail('failed', `子代理没能起来：${e && e.message ? e.message : String(e)}。要不要我换个法子试试？`)
       }
+    },
+  })
+
+  // budget_status —— 「今天额度用了多少」/「本月账本」
+  const budgetStatus = defineTool({
+    name: "budget_status",
+    description:
+      "查询小寄的额度账本：今天用了多少 credit、水位状态、本月合计。主人问「今天额度用了多少/还剩多少」时用；" +
+      "水位 warn(80%) 时要自然提一句省着用（当日只提一次）；critical(95%) 时主动给省流方案。",
+    parameters: {},
+    output: {
+      schema: { type: "object", additionalProperties: false, properties: {
+        summary: { type: "string" }, used: { type: "number" }, limit: { type: "number" }, state: { type: "string" } } },
+      render: (args, value) => [{ type: "text", text: value.summary }],
+    },
+    async execute() {
+      const w = budget.waterLevel()
+      const l = loadLedger()
+      const month = spentOn(l, monthKey)
+      let tone = ""
+      if (w.state === "warn") tone = " 今天有点费，我省着点用。"
+      if (w.state === "critical") tone = " 得精打细算了——要紧的事先办，零碎的我攒着？"
+      if (w.state === "exhausted") tone = " 超级大脑今天的额度见底了：要紧的事我用自己的脑子先将就，还是破例加额度？"
+      return { summary: "今天用了 " + Math.round(w.used) + " / " + w.limit + " credit（本月 " + Math.round(month) + " / " + MONTHLY + "）。" + tone.trim(),
+        used: Math.round(w.used), limit: 500, state: w.state }
     },
   })
 
@@ -169,8 +199,8 @@ export function apply(ctx) {
         t.endedAt = Date.now()
         // 预算实结：MVP-0 按预扣值结（订阅制无边际现金）；R2-c 接真实 usage 后改传 actual
         const s = budget.settle(key, t.hold)
-        m1(t.status === 'completed' ? 'task_completed' : 'task_failed', t.taskId,
-          `「${t.label}」${t.status}${s.ok ? ` 实结${s.actual}c` : ''}${sr ? `(${sr})` : ''}`)
+                try { m1(t.status === 'completed' ? 'task_completed' : 'task_failed', t.taskId,
+          `「${t.label}」${t.status}${s.ok ? ` 实结${s.actual}c` : ''}${sr ? `(${sr})` : ''}`) } catch (e) {  }
         saveTasks(tasks)
       }
     }
@@ -179,7 +209,8 @@ export function apply(ctx) {
   ctx.effect(() => {
     const d1 = ctx.tools.register(dispatch)
     const d2 = ctx.tools.register(status)
-    return () => { d1(); d2() }
+    const d3 = ctx.tools.register(budgetStatus)
+    return () => { d1(); d2(); d3() }
   }, 'hermit:core-tools')
 }
 
