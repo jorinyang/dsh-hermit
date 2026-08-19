@@ -118,7 +118,7 @@ export function apply(ctx) {
       }
       if (escalated) m1('perm_escalated', key, `意图硬规则把权限从 ${provided} 抬到 ${perm}（宁严勿纵）`, 'escalate')
       if (perm === 'P' || perm === 'M') {
-        const conf = await confirmHighRisk(ctx, { permission: perm, intent: args.intent, label })
+        const conf = await confirmHighRisk(ctx, { permission: perm, intent: args.intent, label }, exec)
         if (!conf.ok) return fail('blocked', `${perm} 级确认服务不可用，按「宁可误拒」先拦下。`)
         if (!conf.confirmed) { m1('perm_decision', key, `${perm} 级「${label}」主人拒绝`, 'denied'); return fail('blocked', '主人没点头，这个我就不做了。') }
         m1('perm_decision', key, `${perm} 级「${label}」主人确认放行`, 'approved')

@@ -14,7 +14,7 @@ function appendAudit(entry) {
   } catch {}
 }
 
-export async function confirmHighRisk(ctx, args) {
+export async function confirmHighRisk(ctx, args, exec) {
   const level = args.permission
   if (level !== 'P' && level !== 'M') return { ok: true }
   if (!ctx.userQuestions || typeof ctx.userQuestions.ask !== 'function') {
@@ -26,7 +26,7 @@ export async function confirmHighRisk(ctx, args) {
     ? `主人，我要【${args.intent.slice(0, 60)}】——涉及金钱操作${irreversible}。确认支付吗？`
     : `主人，我要【${args.intent.slice(0, 60)}】——这会对外发布/发送${irreversible}。发吗？`
   try {
-    const ans = await ctx.userQuestions.ask({ questions: [{
+    const ans = await ctx.userQuestions.ask({ ...(exec && exec.agent ? { agent: exec.agent } : {}), ...(exec && exec.signal ? { signal: exec.signal } : {}), questions: [{
       id: 'hermit-perm-' + Date.now(),
       question,
       header: level === 'M' ? '金钱操作确认' : '对外发布确认',
