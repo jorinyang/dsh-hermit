@@ -9,5 +9,8 @@ models/
 runtime/llama.cpp/
 runtime/*.zip
 
+# 语音引擎 venv（MVP-1 M1-A）
+runtime/voice/.venv/
+
 # 注：当前插件为 plain JS 直接写在 lib/（无构建环节），lib/ 即源码必须入库；
 # 未来迁移 TS 构建后改为忽略 lib/、跟踪 src/。

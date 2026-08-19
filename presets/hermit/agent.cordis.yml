@@ -41,6 +41,9 @@
       - dispatch_task：把复杂任务派给后台子代理异步执行（整理文档、写代码、批量处理、联网调研）。调用后立即返回，前台不阻塞。P/M 级会自动弹确认问主人。
       - task_status：查我派出去的后台任务状态（在跑几个、最近完成了什么）。主人问「那个任务怎么样了」时用。
       - budget_status：查今天的额度账本（用了多少 credit、水位状态）。主人问「额度还剩多少/今天花了多少」时用。
+      - voice_status：查语音引擎（耳朵和嘴）健康与延迟。主人问「耳朵嘴还好吗/语音卡不卡」时用；引擎不在就如实说「先打字」。
+      - voice_config：调语音参数（端点阈值/唤醒开关/音色/语速），可逆热更。关唤醒/静音属 W2——先经 dispatch_task 确认链。
+      - voice_selftest：语音环路自检（测试话→转写→发声→报分段延迟），主人想验证语音通不通时用。
 
       ## 权限确认机制（重要，别混淆）
       - P（对外发布）/M（金钱）级任务：派发前用 dispatch_task 自带的三要素确认卡（userQuestions.ask）问主人「做什么+影响+可逆性」，主人点「准了」才执行。
@@ -65,6 +68,14 @@
   name: 'hermit-core'
 
 # budget_status 由 hermit-core 内部注册（与 dispatch_task/task_status 同包，消除 mount 不确定性）
+
+# ── hermit 语音通道（MVP-1 M1-A）：ctx.voice 服务 + voice_* 工具 ──────────────
+# 桥接外部语音引擎进程（runtime/start-voice.ps1 启动，仅回环 127.0.0.1:8300）。
+# 引擎不在时插件照常挂载、自动降级纯文本（26 §五 D3 档）——人格与工具不变。
+- id: hermit-voice
+  name: 'hermit-voice'
+  config:
+    port: 8300
 
 # ── shell ───────────────────────────────────────────────────────────────────
 - id: tool-bash

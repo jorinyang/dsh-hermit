@@ -1,0 +1,20 @@
+# voice.yaml — 语音引擎配置（26 契约 C.5；引擎进程读，DSH 侧 overlay 存 ~/.dsh/hermit-voice-config.json）
+# 仅绑定回环（03 §7.1）。阈值可被 voice_config 工具热更（写回 DSH 侧 overlay）。
+port: 8300
+healthz_port: 8301
+debug: true            # D1 骨架：启用假 ASR/TTS 回环 + debug.* 注入族；D4 全真件后改 false
+endpoint:
+  acoustic_ms: 600     # 声学端点阈值（12 §二）
+  semantic_wait_ms: 1200
+wake:
+  engine: sherpa-onnx  # 26 §8.1 拍板：开放词表 KWS（D3 接入）
+  keywords_file: configs/kws-keywords.txt
+  window_s: 1.5
+voice_preset: 官方预设   # 决策点 1 拍板（2026-08-20）：官方预设先行，克隆后续
+hotwords: configs/hotwords.yaml
+auto_start: false      # 插件不自动拉引擎（26 §C.4）；手工 runtime/start-voice.ps1
+fake:                  # 假件延迟模拟（D2 起被真件替换）
+  asr_partial_ms: 90
+  asr_final_ms: 220
+  tts_first_ms: 90
+  tts_per_char_ms: 40

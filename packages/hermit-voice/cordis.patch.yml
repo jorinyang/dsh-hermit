@@ -1,0 +1,4 @@
+- insert:
+    - id: hermit-voice
+      name: hermit-voice
+      config: {}
