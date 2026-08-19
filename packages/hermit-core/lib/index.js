@@ -110,6 +110,7 @@ export function apply(ctx) {
       const escalated = PERM_ORDER[perm] > PERM_ORDER[provided]
       const label = (args.label ?? args.intent).slice(0, 24)
       const key = args.idempotency_key ?? args.intent.trim().slice(0, 64)
+      let confirmRef = null // 确认凭证（15 §二）：P/M 级确认通过后挂上，子代理执行前自检
       const existing = tasks[key]
       if (existing && existing.status === 'working') {
         return { ok: true, route: 'R2-a', task_id: existing.taskId, status: 'already_running',
@@ -121,6 +122,7 @@ export function apply(ctx) {
         if (!conf.ok) return fail('blocked', `${perm} 级确认服务不可用，按「宁可误拒」先拦下。`)
         if (!conf.confirmed) { m1('perm_decision', key, `${perm} 级「${label}」主人拒绝`, 'denied'); return fail('blocked', '主人没点头，这个我就不做了。') }
         m1('perm_decision', key, `${perm} 级「${label}」主人确认放行`, 'approved')
+        confirmRef = 'cfm_' + Date.now().toString(36) // 确认凭证
       }
       const hold = budget.hold(key, args.complexity)
       if (!hold.ok) {
@@ -140,12 +142,12 @@ export function apply(ctx) {
         const start = await ctx.subagents.startContinuable({
           provider: 'spawn',
           label,
-          request: { parent, prompt: [{ type: 'text', text: buildBrief(args, route) }], agentOptions: { provider: route.provider, model: route.model } },
+          request: { parent, prompt: [{ type: 'text', text: buildBrief(args, route, confirmRef) }], agentOptions: { provider: route.provider, model: route.model } },
           signal: exec.signal,
         })
         const taskId = String(start.childId)
         tasks[key] = { taskId, childId: String(start.childId), label, status: 'working',
-          startedAt: Date.now(), perm, complexity: args.complexity ?? 'medium', hold: hold.credits, model: route.model }
+          startedAt: Date.now(), perm, complexity: args.complexity ?? 'medium', hold: hold.credits, model: route.model, confirmRef }
         saveTasks(prune(tasks))
         m1('task_dispatched', taskId, `「${label}」${perm}级/${args.complexity ?? 'medium'}，预扣${hold.credits}c，模型${route.model}(${route.why})`)
         return { ok: true, route: 'R2-a', task_id: taskId, status: 'dispatched',
@@ -236,14 +238,24 @@ function describe(t) {
   return `「${t.label}」已${t.status === 'completed' ? '完成' : (t.status === 'cancelled' ? '取消' : '失败')}${tail}。`
 }
 /** brief：硬要求子代理完成后用 report 工具带「结果摘要+产物+建议下一步」回报（03 §2.3 ReportEvent 落地）。 */
-function buildBrief(args, route) {
+function buildBrief(args, route, confirmRef) {
+  const perm = args.permission ?? 'R'
   const lines = [
     '你是小寄（Hermit）派出的执行子代理。请独立完成下面这个任务。',
     '',
     `【任务】${args.intent}`,
   ]
   if (args.complexity) lines.push(`【复杂度】${args.complexity}`)
-  lines.push(`【权限级别】${args.permission ?? 'R'}（R只读/W1可逆写/W2不可逆写/P对外发布/M金钱）——越权操作一律拒绝。`)
+  lines.push(`【权限级别】${perm}（R只读/W1可逆写/W2不可逆写/P对外发布/M金钱）——越权操作一律拒绝。`)
+  lines.push(`【确认凭证】${confirmRef || '无'}（P/M 级任务经主人确认后才有；R/W1/W2 级为空）`)
+  // 15 §二 纵深防御：子代理执行前自主校验任务类型/权限，级别对不上就刹车回报，不靠前台自觉
+  lines.push(
+    '',
+    '【执行前自检（硬规则，必须做）】在动手前，先判断本任务**实际**需要的权限级别：',
+    '  - 若操作会离开本机到公网/外部服务/发给他人（发布、上传、push、发送、发邮件/飞书/微信、公开仓库、评论留言、部署上线）→ 实为 **P 级**；涉及金钱支付 → **M 级**。',
+    '  - 若你被判的级别【权限级别】低于操作实际所需级别，且【确认凭证】为空 → **立即中止，不要执行**，用 report 工具回报：「权限不足：此操作实为 X 级，需要主人先确认」，等前台重新用正确级别派发+确认后再继续。',
+    '  - 宁严勿纵：拿不准就按更高级别处理并先用 report 问主人。',
+  )
   if (args.privacy === 'brief_only') lines.push('【隐私】本任务涉隐私未授权：不要读取/外传原始隐私数据，只处理语义摘要。')
   lines.push(
     '',
