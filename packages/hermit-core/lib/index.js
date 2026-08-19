@@ -83,7 +83,7 @@ export function apply(ctx) {
     description:
       '把需要「动手」的任务（读/写文件、执行命令、多步操作、联网调研、批量处理、产出保存）委派给子代理异步执行。' +
       '调用后立即返回，前台不阻塞；子代理完成后会带「结果摘要+建议下一步」回报，你再即兴连概况一起转告主人。' +
-      '闲聊/纯对话/一句话能答的查询不要调用，直接回答即可。P/M 级会自动弹确认问主人。幂等：同一 idempotency_key 不重复派发。',
+      '闲聊/纯对话/一句话能答的查询不要调用，直接回答即可。P/M 级会先弹三要素确认卡（userQuestions.ask）问主人，主人点「准了」才执行——这个确认卡独立于 DSH 的 Full access/审批开关，Full access 下也照样弹，别拿审批开关当不弹卡的理由。幂等：同一 idempotency_key 不重复派发。',
     parameters: {
       intent: { type: 'string', required: true, description: '任务意图完整描述（含上下文与期望产出）' },
       label: { type: 'string', description: '简短任务标签（≤24字）' },
