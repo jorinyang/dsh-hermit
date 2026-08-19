@@ -11,7 +11,7 @@ character_card:
     emotion_level: 8                  # 情绪幅度 1-10（偏外放，04 主人拍板）
     humor_style: 冷幽默
   voice:
-    tts_preset: 待选                  # Qwen3-TTS 预设/克隆音色（MVP-1）
+    tts_preset: 官方预设              # 决策点1 拍板（2026-08-20）：Qwen3-TTS 官方预设先行，克隆音色后续迭代
     speech_habits: []
   wake:
     wake_word: 小寄
