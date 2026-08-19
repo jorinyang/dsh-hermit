@@ -20,6 +20,16 @@ export const name = 'hermit-core'
 export const inject = ['tools', 'subagents', 'userQuestions']
 
 const PERMISSIONS = ['R', 'W1', 'W2', 'P', 'M']
+const PERM_ORDER = { R: 0, W1: 1, W2: 2, P: 3, M: 4 }
+/** 权限下限硬规则（15 §一「拿不准就升一级，宁严勿纵」的确定性落地）：对任务文本判出最低权限级，前台报低了由工具层抬上去。 */function permissionFloor(text) {
+  const t = String(text || '').toLowerCase()
+  if (/支付|付款|购买|下单|充值|转账|订阅|付费|订单/.test(t)) return 'M'
+  if (/发给|发送给|发到|发布|公开|公网|上传|推送|\bpush\b|publish|github|gitlab|博客|朋友圈|推特|twitter|评论|留言|部署上线|上线|飞书|钉钉|邮件|email|微信|发到.*(?:仓库|网|群|人|同事|朋友)/.test(t)) return 'P'
+  if (/删除|覆盖|重命名|移动|格式化|清空|移除/.test(t)) return 'W2'
+  if (/新建|创建|写入|保存|生成|写一份|记录|添加|整理成/.test(t)) return 'W1'
+  return 'R'
+}
+const maxPermission = (a, b) => (PERM_ORDER[a] >= PERM_ORDER[b] ? a : b)
 const MAX_TASKS = 100
 const TASKS_FILE = path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'hermit-tasks.json')
 
@@ -92,7 +102,12 @@ export function apply(ctx) {
       render: (args, value) => [{ type: 'text', text: value.ok ? value.summary : ('派发失败：' + value.error) }],
     },
     async execute(args, exec) {
-      const perm = args.permission ?? 'R'
+      try { fs.appendFileSync('C:/Users/Aorus/hermit-dispatch-probe.log', new Date().toISOString() + ' dispatch_task EXECUTED label=' + (args.label||'') + '\n', 'utf8') } catch {}
+      const provided = args.permission ?? 'R'
+      // 权限下限硬闸门：意图硬规则抬级（前台报低了也会被抬上去，纵深防御不靠前台自觉）
+      const floor = permissionFloor(args.intent + ' ' + (args.label || ''))
+      const perm = maxPermission(provided, floor)
+      const escalated = PERM_ORDER[perm] > PERM_ORDER[provided]
       const label = (args.label ?? args.intent).slice(0, 24)
       const key = args.idempotency_key ?? args.intent.trim().slice(0, 64)
       const existing = tasks[key]
@@ -100,6 +115,7 @@ export function apply(ctx) {
         return { ok: true, route: 'R2-a', task_id: existing.taskId, status: 'already_running',
           summary: `「${existing.label}」已经在办了（任务 ${existing.taskId}），还没完——好了我告诉你。`, error: '', model: '' }
       }
+      if (escalated) m1('perm_escalated', key, `意图硬规则把权限从 ${provided} 抬到 ${perm}（宁严勿纵）`, 'escalate')
       if (perm === 'P' || perm === 'M') {
         const conf = await confirmHighRisk(ctx, { permission: perm, intent: args.intent, label })
         if (!conf.ok) return fail('blocked', `${perm} 级确认服务不可用，按「宁可误拒」先拦下。`)
