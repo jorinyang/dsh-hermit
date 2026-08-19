@@ -1,9 +1,23 @@
-/** hermit-core 内部模块：P/M 三要素确认链（15 §二/三）+ 审计（15 §五）。同包 ./ 导入。 */
+/** hermit-core 内部模块：P/M 三要素确认链（15 §二/三）+ 审计（15 §五）+ 确认幂等缓存（同 taskKey TTL 内复用凭证）。同包 ./ 导入。 */
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
 const AUDIT_FILE = path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'hermit-audit.json')
+// 确认凭证缓存（幂等）：同 taskKey 在 TTL 内复用此前已确认的凭证，避免失败重试时重复弹卡
+const CONFIRM_TTL_MS = 30 * 60 * 1000  // 30 分钟（足够重试周期，不过度放宽）
+const confirmCache = new Map()  // taskKey -> { ref, ts }
+export function getCachedConfirmRef(key) {
+  if (!key) return null
+  const e = confirmCache.get(key)
+  if (!e) return null
+  if (Date.now() - e.ts > CONFIRM_TTL_MS) { confirmCache.delete(key); return null }
+  return e.ref
+}
+export function cacheConfirmRef(key, ref) {
+  if (!key || !ref) return
+  confirmCache.set(key, { ref, ts: Date.now() })
+}
 function appendAudit(entry) {
   try {
     const a = (() => { try { return JSON.parse(fs.readFileSync(AUDIT_FILE, 'utf8')) } catch { return { entries: [] } } })()

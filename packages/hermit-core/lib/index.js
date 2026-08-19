@@ -10,7 +10,7 @@
  */
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { budgetApi, spentOn, monthKey, MONTHLY } from './budget.js'
-import { confirmHighRisk } from './permission.js'
+import { confirmHighRisk, getCachedConfirmRef, cacheConfirmRef } from './permission.js'
 import { record as m1 } from './memory.js'
 import fs from 'node:fs'
 import os from 'node:os'
@@ -118,11 +118,19 @@ export function apply(ctx) {
       }
       if (escalated) m1('perm_escalated', key, `意图硬规则把权限从 ${provided} 抬到 ${perm}（宁严勿纵）`, 'escalate')
       if (perm === 'P' || perm === 'M') {
-        const conf = await confirmHighRisk(ctx, { permission: perm, intent: args.intent, label }, exec)
-        if (!conf.ok) return fail('blocked', `${perm} 级确认服务不可用，按「宁可误拒」先拦下。`)
-        if (!conf.confirmed) { m1('perm_decision', key, `${perm} 级「${label}」主人拒绝`, 'denied'); return fail('blocked', '主人没点头，这个我就不做了。') }
-        m1('perm_decision', key, `${perm} 级「${label}」主人确认放行`, 'approved')
-        confirmRef = 'cfm_' + Date.now().toString(36) // 确认凭证
+        // 幂等：同 taskKey 在 TTL 内复用此前确认凭证（子代理失败重试场景不重复弹卡）
+        const cachedRef = getCachedConfirmRef(key)
+        if (cachedRef) {
+          confirmRef = cachedRef
+          m1('perm_decision', key, `${perm} 级「${label}」复用凭证 ${cachedRef}（幂等）`, 'reused')
+        } else {
+          const conf = await confirmHighRisk(ctx, { permission: perm, intent: args.intent, label }, exec)
+          if (!conf.ok) return fail('blocked', `${perm} 级确认服务不可用，按「宁可误拒」先拦下。`)
+          if (!conf.confirmed) { m1('perm_decision', key, `${perm} 级「${label}」主人拒绝`, 'denied'); return fail('blocked', '主人没点头，这个我就不做了。') }
+          m1('perm_decision', key, `${perm} 级「${label}」主人确认放行`, 'approved')
+          confirmRef = 'cfm_' + Date.now().toString(36)
+          cacheConfirmRef(key, confirmRef)
+        }
       }
       const hold = budget.hold(key, args.complexity)
       if (!hold.ok) {
