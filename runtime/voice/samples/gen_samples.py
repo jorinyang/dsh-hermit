@@ -56,6 +56,18 @@ speak("小寄", POS / "x1_r-2.wav", rate_delta=-2)
 speak("小寄", POS / "x1_r2.wav", rate_delta=2)
 speak("小寄，你在吗", POS / "x1_tail.wav")
 
+print("== 正样本：小寄同学 ×4（主人 2026-08-20 追加）==")
+speak("小寄同学", POS / "xt_r0.wav")
+speak("小寄同学", POS / "xt_r-2.wav", rate_delta=-2)
+speak("小寄同学", POS / "xt_r2.wav", rate_delta=2)
+speak("小寄同学，帮我记个提醒", POS / "xt_tail.wav")
+
+print("== 正样本：小寄酱 ×4（主人 2026-08-20 追加）==")
+speak("小寄酱", POS / "xj_r0.wav")
+speak("小寄酱", POS / "xj_r-2.wav", rate_delta=-2)
+speak("小寄酱", POS / "xj_r2.wav", rate_delta=2)
+speak("小寄酱，你在吗", POS / "xj_tail.wav")
+
 print("== 负样本：近似音陷阱 ×10 ==")
 for i, w in enumerate(["小季", "小纪", "小鸡", "小吉", "书记", "消极", "小姐", "小杰", "晓洁", "呼吸机"], 1):
     speak(w, NEG / f"near_{i:02d}.wav")
