@@ -17,6 +17,17 @@ wake:
   keywords_file: configs/kws-keywords.txt   # 相对仓库根；gen_keywords.py 生成
   dialog_window_s: 30  # 免唤醒窗（12 §五.2）；窗内免唤醒，对话态每次 final 刷新
 voice_preset: 官方预设   # 决策点 1 拍板（2026-08-20）：官方预设先行，克隆后续
+tts:
+  voice: zf_xiaoni   # kokoro 中文音色（待实机听感定夺，见 26 §8.2）；可填名或数字 sid
+  speed: 1.0
+barge:
+  # barge-in VAD（silero）：播报期间 mic 检测主人插话→停播（≤100ms 让麦）。
+  # yield 拆解：引擎反应环 ~5ms + silero min_speech_duration（连续语音时长阈值）。
+  # ⚠️ 回声限制：扬声器外放会被 mic 拾回导致自打断；真机建议耳机，AEC 属 MVP-2
+  enabled: true
+  threshold: 0.5          # 语音概率阈值
+  min_speech_duration: 0.1  # 连续语音时长阈值（s）；调低更敏捷但误打断↑
+  min_silence_duration: 0.3
 hotwords: configs/hotwords.yaml
 auto_start: false      # 插件不自动拉引擎（26 §C.4）；手工 runtime/start-voice.ps1
 fake:                  # 假件延迟模拟（asr 假件仅 debug 注入用；tts 假件 D4 替换）

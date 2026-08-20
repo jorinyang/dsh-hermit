@@ -40,7 +40,7 @@ v.debugInject('asr', { text: '冒烟测试一句话。' })
 await new Promise(r => setTimeout(r, 700))
 const r1 = v.speak({ text: '冒烟发声。', source: 'selftest' })
 check('speak delivered', r1.delivered === true, r1.utterance_id)
-await new Promise(r => setTimeout(r, 1200))
+await new Promise(r => setTimeout(r, 5000)) // 真 TTS 合成(~1.4s)+播放(~1s)，等 tts.finished 到位
 check('voice/wake 事件', events.some(([e]) => e === 'voice/wake'))
 check('voice/transcript.final 事件', events.some(([e]) => e === 'voice/transcript.final'))
 check('voice/state 到 processing', events.some(([e, p]) => e === 'voice/state' && p.to === 'processing'))

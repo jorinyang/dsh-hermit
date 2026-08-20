@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from asr import AsrPipeline  # noqa: E402
 from audio_source import MicSource, WavInjectSource, load_wav_16k  # noqa: E402
 from kws import KwsGate  # noqa: E402
+from tts import TtsEngine  # noqa: E402
 
 PROTOCOL_VERSION = 1
 HERE = Path(__file__).resolve().parent
@@ -39,6 +40,7 @@ def load_config():
         "mic": {"enabled": True},
         "endpoint": {"acoustic_ms": 600, "semantic_wait_ms": 1200},
         "wake": {"enabled": True, "engine": "sherpa-onnx", "keywords_file": "configs/kws-keywords.txt", "dialog_window_s": 30},
+        "tts": {"voice": "zf_xiaoni", "speed": 1.0},
         "fake": {"asr_partial_ms": 90, "asr_final_ms": 220, "tts_first_ms": 90, "tts_per_char_ms": 40},
     }
     try:
@@ -49,7 +51,7 @@ def load_config():
             for k in ("port", "healthz_port", "debug"):
                 if k in data:
                     cfg[k] = data[k]
-            for k in ("asr", "mic", "endpoint", "fake", "wake"):
+            for k in ("asr", "mic", "endpoint", "fake", "wake", "tts"):
                 if isinstance(data.get(k), dict):
                     cfg[k].update(data[k])
         # 相对路径锚定仓库根（HERMIT/runtime/voice → HERMIT/），不受进程 CWD 影响
@@ -71,6 +73,8 @@ ENGINE_STATE = {"state": "idle"}
 START = time.time()
 PIPELINE = {"asr": None, "mode": "fake", "mic_error": None}  # 全局单例：WS 会话与 HTTP 端点共用
 KWS = {"gate": None, "enabled": False}  # 唤醒门控单例（D3）
+TTS = {"engine": None, "ready": False}  # TTS 引擎单例（D4）
+BARGIN = {"vad": None}  # barge-in 静音检测 VAD（silero，D4）
 ASR_LOCK = asyncio.Lock()
 LAST_ASR = {"text": "", "at": 0.0}
 
@@ -89,6 +93,9 @@ class Conn:
         self.speak_task = None
         self.current_utterance = None
         self.status_task = None
+        self.speak_active = False        # 正在播报（barge-in 监听窗口）
+        self.barge_signal = threading.Event()  # 线程安全：VAD 命中 → 停播
+        self.barge_speech_at = None      # 首次检测到主人语音的时间戳（算 yield_ms）
 
     async def send(self, _type, payload=None, _id=None):
         frame = {"v": PROTOCOL_VERSION, "id": _id or f"e{now_ms()}", "type": _type, "ts": now_ms(), "payload": payload or {}}
@@ -107,7 +114,86 @@ class Conn:
             await self.send("state", st)
 
 
-# ── 假 TTS（D1 保留件，D4 换 Qwen3-TTS）───────────────────────────────
+# ── 真件 TTS 播报 + barge-in（D4）────────────────────────────────────
+def _play_blocking(samples, rate, conn):
+    """阻塞播放（跑在 executor 线程）；conn.barge_signal set → 立即停，返回 (status, played_ms, stop_time)。
+
+    32ms 小块写入，每块之间查 barge_signal → 反应粒度 ~32ms，满足 100ms 让麦（12 §4.1）。
+    """
+    import sounddevice as sd
+    chunk = max(rate // 32, 512)
+    stream = sd.OutputStream(samplerate=rate, channels=1, dtype="float32")
+    stream.start()
+    pos = 0
+    try:
+        while pos < len(samples):
+            if conn.barge_signal.is_set():
+                return "barged", int(pos / rate * 1000), time.time()
+            end = min(pos + chunk, len(samples))
+            stream.write(samples[pos:end])
+            pos = end
+        # 尾部排空（sounddevice write 已阻塞到送入缓冲；再小睡保证播完）
+        stream.stop()
+        stream.close()
+        return "done", int(len(samples) / rate * 1000), time.time()
+    finally:
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
+async def real_speak(conn: Conn, p):
+    """真 TTS：合成（executor 线程）→ 播报（executor 线程，barge 可打断）→ tts.finished/stopped。"""
+    uid = p.get("utterance_id", "")
+    text = str(p.get("text", ""))
+    tts = TTS["engine"]
+    loop = asyncio.get_running_loop()
+    conn.barge_signal.clear()
+    conn.barge_speech_at = None
+    if BARGIN["vad"]:
+        BARGIN["vad"].reset()
+    try:
+        t0 = time.time()
+        samples = await loop.run_in_executor(None, tts.synthesize, text, float(p.get("rate", 1.0) or 1.0))
+        first_ms = int((time.time() - t0) * 1000)
+        rate = tts.sample_rate
+        await conn.send("tts.started", {"utterance_id": uid, "first_packet_ms": first_ms})
+        await conn.emit_state("speaking", "tts-started")
+        conn.speak_active = True
+        status, played_ms, stop_time = await loop.run_in_executor(None, _play_blocking, samples, rate, conn)
+        conn.speak_active = False
+        if status == "barged":
+            COUNTERS["barge_ins"] += 1
+            yield_ms = int((stop_time - conn.barge_speech_at) * 1000) if conn.barge_speech_at else None
+            await conn.send("tts.stopped", {"utterance_id": uid, "reason": "barge_in", "yield_ms": yield_ms, "tts_played_ms": played_ms})
+            await conn.send("barge_in.detected", {"yield_ms": yield_ms, "tts_played_ms": played_ms})
+            await conn.emit_state("listening", "barge-in")
+        else:
+            COUNTERS["tts_finished"] += 1
+            await conn.send("tts.finished", {"utterance_id": uid, "duration_ms": played_ms, "first_packet_ms": first_ms})
+            await conn.emit_state("listening" if time.time() < conn.dialog_until else "idle", "tts-finished")
+    except asyncio.CancelledError:
+        conn.speak_active = False
+        if getattr(conn.speak_task, "_barge", False):
+            COUNTERS["barge_ins"] += 1
+            await conn.send("tts.stopped", {"utterance_id": uid, "reason": "barge_in", "yield_ms": None, "tts_played_ms": None})
+            await conn.send("barge_in.detected", {"yield_ms": None, "tts_played_ms": None})
+            await conn.emit_state("listening", "barge-in")
+        else:
+            await conn.send("tts.stopped", {"utterance_id": uid, "reason": "superseded"})
+        raise
+    except Exception as e:
+        conn.speak_active = False
+        await conn.send("engine.error", {"code": "E_TTS_TIMEOUT", "message": f"TTS 失败：{e}", "degrade_hint": "text_only"})
+        await conn.emit_state("listening" if time.time() < conn.dialog_until else "idle", "tts-error")
+
+
+# ── 假 TTS（TTS 未就绪时的降级件，D1 保留）───────────────────────────
 async def fake_speak(conn: Conn, p):
     uid = p.get("utterance_id", "")
     text = str(p.get("text", ""))
@@ -116,12 +202,15 @@ async def fake_speak(conn: Conn, p):
         await asyncio.sleep(fake["tts_first_ms"] / 1000)
         await conn.send("tts.started", {"utterance_id": uid, "first_packet_ms": fake["tts_first_ms"]})
         await conn.emit_state("speaking", "tts-started")
+        conn.speak_active = True
         duration = min(6.0, max(0.5, 0.4 + len(text) * fake["tts_per_char_ms"] / 1000))
         await asyncio.sleep(duration)
+        conn.speak_active = False
         COUNTERS["tts_finished"] += 1
         await conn.send("tts.finished", {"utterance_id": uid, "duration_ms": int(duration * 1000)})
         await conn.emit_state("listening" if time.time() < conn.dialog_until else "idle", "tts-finished")
     except asyncio.CancelledError:
+        conn.speak_active = False
         reason = "barge_in" if getattr(conn.speak_task, "_barge", False) else "superseded"
         if reason == "barge_in":
             COUNTERS["barge_ins"] += 1
@@ -241,8 +330,25 @@ class Router:
                 frames.extend(self._pipeline_event_frames(PIPELINE["asr"].feed(block)))
         return frames
 
+    def _barge_feed(self, block):
+        """speaking 期间：mic 帧进 silero VAD，命中即置 barge_signal（本地闭环停播，不等 DSH）。"""
+        if block.dtype != np.float32:
+            block = block.astype(np.float32) / 32768.0
+        vad = BARGIN["vad"]
+        for i in range(0, len(block), 512):
+            w = block[i:i + 512]
+            if len(w) < 512:
+                break
+            vad.accept_waveform(w)
+            if vad.is_speech_detected():
+                if self.conn.barge_speech_at is None:
+                    self.conn.barge_speech_at = time.time()
+                self.conn.barge_signal.set()
+                vad.reset()
+                break
+
     async def feeder(self):
-        """麦克风帧 → 路由（注入期间暂停消费，避免混音）。"""
+        """麦克风帧 → 路由（speaking 期只喂 barge VAD；注入期间暂停消费，避免混音）。"""
         while True:
             if self.injecting:
                 await asyncio.sleep(0.02)
@@ -250,6 +356,9 @@ class Router:
             try:
                 block = await asyncio.wait_for(self.audio_q.get(), timeout=0.2)
             except asyncio.TimeoutError:
+                continue
+            if self.conn.speak_active and BARGIN["vad"]:
+                self._barge_feed(block)
                 continue
             for t, p in self._feed_block(block):
                 await self.conn.send(t, p)
@@ -265,6 +374,34 @@ class Router:
             if ENGINE_STATE["state"] == "listening" and time.time() > self.conn.dialog_until and not self.conn.speak_task:
                 ENGINE_STATE["state"] = "idle"
                 await self.conn.send("state", {"from": "listening", "to": "idle", "reason": "window-expired"})
+
+    async def inject_mic(self, path, speed=0.0):
+        """确定性 barge-in 测试：WAV 直接喂 barge VAD（模拟主人插话，无回声干扰）。"""
+        if not BARGIN["vad"]:
+            await self.conn.send("engine.error", {"code": "E_TTS_TIMEOUT", "message": "barge VAD 未就绪", "degrade_hint": "retry"})
+            return
+        try:
+            src = WavInjectSource(path, speed=speed)
+
+            def feed(block):
+                if block.dtype != np.float32:
+                    block = block.astype(np.float32) / 32768.0
+                vad = BARGIN["vad"]
+                for i in range(0, len(block), 512):
+                    w = block[i:i + 512]
+                    if len(w) < 512:
+                        break
+                    vad.accept_waveform(w)
+                    if vad.is_speech_detected():
+                        if self.conn.barge_speech_at is None:
+                            self.conn.barge_speech_at = time.time()
+                        self.conn.barge_signal.set()
+                        vad.reset()
+                        break
+
+            await src.run(feed, lambda: None)
+        except Exception as e:
+            await self.conn.send("engine.error", {"code": "E_TTS_TIMEOUT", "message": f"mic 注入失败：{e}", "degrade_hint": "retry"})
 
     async def inject_wav(self, path, speed=0.0):
         """WAV 注入：走同一条路由（含 KWS 门控），确定性测试/自检通道。"""
@@ -304,10 +441,13 @@ async def handler(ws):
     try:
         await conn.send("engine.ready", {
             "models": (["funasr-streaming-paraformer-zh-en"] if PIPELINE["mode"] == "real" else [])
-                + (["kws-zipformer-wenetspeech-3.3M"] if KWS["enabled"] else []) + ["fake-tts"],
+                + (["kws-zipformer-wenetspeech-3.3M"] if KWS["enabled"] else [])
+                + (["kokoro-multi-lang-v1_0"] if TTS["ready"] else ["fake-tts"]),
             "device": "cpu" if PIPELINE["mode"] == "real" else "skeleton",
             "asr_mode": PIPELINE["mode"],
             "kws": "on" if KWS["enabled"] else "off",
+            "tts": "on" if TTS["ready"] else "off",
+            "barge_vad": "on" if BARGIN["vad"] else "off",
             "mic": ("ok" if router.mic else (PIPELINE["mic_error"] or "off")),
         })
         await router.start()
@@ -333,7 +473,7 @@ async def handler(ws):
                 if conn.speak_task:
                     conn.speak_task.cancel()
                     await asyncio.sleep(0)
-                conn.speak_task = asyncio.create_task(fake_speak(conn, p))
+                conn.speak_task = asyncio.create_task(real_speak(conn, p) if TTS["ready"] else fake_speak(conn, p))
             elif mtype == "tts.stop":
                 if conn.speak_task:
                     conn.speak_task.cancel()
@@ -366,8 +506,15 @@ async def handler(ws):
             elif mtype == "debug.inject_bargein" and CFG["debug"]:
                 if conn.speak_task:
                     conn.speak_task._barge = True
+                    if TTS["ready"]:
+                        # 真件：走真实停播机制（barge_signal 让 _play_blocking 收手，不依赖 task cancel）
+                        if conn.barge_speech_at is None:
+                            conn.barge_speech_at = time.time()
+                        conn.barge_signal.set()
                     conn.speak_task.cancel()
                     await asyncio.sleep(0)
+            elif mtype == "debug.inject_mic" and CFG["debug"]:
+                await router.inject_mic(p.get("path", ""), float(p.get("speed", 0)))
             elif mtype == "debug.inject_wav" and CFG["debug"]:
                 await router.inject_wav(p.get("path", ""), float(p.get("speed", 0)))
     except websockets.ConnectionClosed:
@@ -462,6 +609,40 @@ def init_kws():
         print(f"[voice-engine] WARN: KWS unavailable ({e}); routing = always-ASR", file=sys.stderr)
 
 
+def init_tts():
+    """真件 TTS（D4，kokoro）。缺件降级 fake-tts，WARN 不静默。"""
+    try:
+        TTS["engine"] = TtsEngine(CFG["asr"]["models_dir"], voice=CFG["tts"].get("voice", "zf_xiaoni"))
+        TTS["ready"] = True
+        print(f"[voice-engine] TTS ready: kokoro-multi-lang (cpu) voice={TTS['engine'].voice} sid={TTS['engine'].sid}", file=sys.stderr)
+    except Exception as e:
+        TTS["engine"] = None
+        TTS["ready"] = False
+        print(f"[voice-engine] WARN: TTS unavailable ({e}); falling back to fake-tts", file=sys.stderr)
+
+
+def init_barge():
+    """barge-in 静音检测 VAD（silero，D4）。缺件则 barge-in 只走 debug.inject_bargein。"""
+    try:
+        import sherpa_onnx as so
+        b = CFG.get("barge", {})
+        silero = so.SileroVadModelConfig()
+        silero.model = str(Path(CFG["asr"]["models_dir"]) / "silero_vad.onnx")
+        silero.threshold = float(b.get("threshold", 0.5))
+        silero.min_silence_duration = float(b.get("min_silence_duration", 0.3))
+        silero.min_speech_duration = float(b.get("min_speech_duration", 0.1))
+        cfg = so.VadModelConfig()
+        cfg.silero_vad = silero
+        cfg.sample_rate = 16000
+        cfg.num_threads = 1
+        cfg.provider = "cpu"
+        BARGIN["vad"] = so.VoiceActivityDetector(cfg)
+        print("[voice-engine] barge VAD ready: silero", file=sys.stderr)
+    except Exception as e:
+        BARGIN["vad"] = None
+        print(f"[voice-engine] WARN: barge VAD unavailable ({e}); barge-in 走 debug.inject_bargein", file=sys.stderr)
+
+
 def init_pipeline():
     """启动即装真流水线（auto：模型不全则回退 fake 并大声说明）。"""
     mode = CFG["asr"].get("mode", "auto")
@@ -485,6 +666,8 @@ async def main():
     init_pipeline()
     if PIPELINE["mode"] == "real":
         init_kws()
+    init_tts()
+    init_barge()
     server = ThreadingHTTPServer(("127.0.0.1", hport), HttpApi)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     async with websockets.serve(handler, "127.0.0.1", port, max_size=1 << 20):

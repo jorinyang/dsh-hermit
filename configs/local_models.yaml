@@ -10,7 +10,7 @@ models:
     role: brain
     vram_gb: 6.26
     ctx_size: 32768
-  # 语音（M1-A D2/D3 落地，26 §8.2）：sherpa-onnx 流式 paraformer int8（RTF≈0.08）
-  # + KWS zipformer-wenetspeech-3.3M int8（唤醒「小寄小寄」，D3）；模型在 models/voice/
-  # Fun-ASR-Nano 离线档 sherpa 原生支持（备查）
-  # 后续挂载（02）：r1=Qwen3.5-4B / tts=Qwen3-TTS / vlm=Qwen3-VL-4B(按需)
+  # 语音（M1-A D2/D3/D4 落地，26 §8.2）：sherpa-onnx 流式 paraformer int8（RTF≈0.08）
+  # + KWS zipformer-wenetspeech-3.3M int8（唤醒）+ TTS kokoro-multi-lang（中文, lang=zh）
+  # + silero_vad.onnx（barge-in）；模型在 models/voice/。Fun-ASR-Nano 离线档 sherpa 原生支持（备查）
+  # 后续挂载（02）：r1=Qwen3.5-4B / vlm=Qwen3-VL-4B(按需)
