@@ -3,3 +3,5 @@ pyyaml>=6
 numpy>=1.24
 sherpa-onnx>=1.13
 sounddevice>=0.4.6
+sentencepiece>=0.2
+pypinyin>=0.51

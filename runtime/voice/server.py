@@ -26,6 +26,7 @@ import websockets
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from asr import AsrPipeline  # noqa: E402
 from audio_source import MicSource, WavInjectSource, load_wav_16k  # noqa: E402
+from kws import KwsGate  # noqa: E402
 
 PROTOCOL_VERSION = 1
 HERE = Path(__file__).resolve().parent
@@ -37,6 +38,7 @@ def load_config():
         "asr": {"mode": "auto", "models_dir": str(HERE.parent.parent / "models" / "voice")},
         "mic": {"enabled": True},
         "endpoint": {"acoustic_ms": 600, "semantic_wait_ms": 1200},
+        "wake": {"enabled": True, "engine": "sherpa-onnx", "keywords_file": "configs/kws-keywords.txt", "dialog_window_s": 30},
         "fake": {"asr_partial_ms": 90, "asr_final_ms": 220, "tts_first_ms": 90, "tts_per_char_ms": 40},
     }
     try:
@@ -47,23 +49,28 @@ def load_config():
             for k in ("port", "healthz_port", "debug"):
                 if k in data:
                     cfg[k] = data[k]
-            for k in ("asr", "mic", "endpoint", "fake"):
+            for k in ("asr", "mic", "endpoint", "fake", "wake"):
                 if isinstance(data.get(k), dict):
                     cfg[k].update(data[k])
         # 相对路径锚定仓库根（HERMIT/runtime/voice → HERMIT/），不受进程 CWD 影响
+        root = HERE.parent.parent
         md = cfg["asr"].get("models_dir", "")
         if md and not Path(md).is_absolute():
-            cfg["asr"]["models_dir"] = str((HERE.parent.parent / md).resolve())
+            cfg["asr"]["models_dir"] = str((root / md).resolve())
+        kf = cfg["wake"].get("keywords_file", "")
+        if kf and not Path(kf).is_absolute():
+            cfg["wake"]["keywords_file"] = str((root / kf).resolve())
     except Exception as e:
         print(f"[voice-engine] config fallback: {e}", file=sys.stderr)
     return cfg
 
 
 CFG = load_config()
-COUNTERS = {"connections": 0, "asr_finals": 0, "asr_reals": 0, "tts_finished": 0, "barge_ins": 0, "http_transcriptions": 0}
+COUNTERS = {"connections": 0, "asr_finals": 0, "asr_reals": 0, "tts_finished": 0, "barge_ins": 0, "http_transcriptions": 0, "wake_fires": 0}
 ENGINE_STATE = {"state": "idle"}
 START = time.time()
 PIPELINE = {"asr": None, "mode": "fake", "mic_error": None}  # 全局单例：WS 会话与 HTTP 端点共用
+KWS = {"gate": None, "enabled": False}  # 唤醒门控单例（D3）
 ASR_LOCK = asyncio.Lock()
 LAST_ASR = {"text": "", "at": 0.0}
 
@@ -164,15 +171,18 @@ class Router:
                 await self.conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风不可用：{self.mic.error}", "degrade_hint": "check_device"})
                 self.mic = None
         self.feeder_task = asyncio.create_task(self.feeder())
+        self.ticker_task = asyncio.create_task(self.window_ticker())
 
     async def stop(self):
-        if self.feeder_task:
-            self.feeder_task.cancel()
-            try:
-                await self.feeder_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self.feeder_task = None
+        for task in (self.feeder_task, getattr(self, "ticker_task", None)):
+            if task:
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+        self.feeder_task = None
+        self.ticker_task = None
         if self.mic:
             self.mic.stop()
             self.mic = None
@@ -183,24 +193,56 @@ class Router:
                 break
 
     def _pipeline_event_frames(self, ev):
-        """AsrPipeline 事件 → 协议帧列表（顺序敏感：endpoint 在 final 前）。"""
+        """AsrPipeline 事件 → 协议帧列表（顺序敏感：endpoint 在 final 前；state 迁移内联）。"""
         if not ev:
             return []
         frames = []
         if ev["type"] == "start":
             frames.append(("vad.start", {}))
             if ENGINE_STATE["state"] == "idle":
-                frames.append(("state", {"from": "idle", "to": "listening", "reason": "vad-start"}))
                 ENGINE_STATE["state"] = "listening"
+                frames.append(("state", {"from": "idle", "to": "listening", "reason": "vad-start"}))
         elif ev["type"] == "partial":
             frames.append(("asr.partial", {"text": ev["text"]}))
         elif ev["type"] == "final":
+            if not ev.get("text"):
+                # 纯唤醒词召唤/噪声端点：空文本不送 DSH（12 §五.3 拒识语义）
+                if ENGINE_STATE["state"] == "listening":
+                    frames.append(("state", {"from": "listening", "to": "listening", "reason": "empty-final"}))
+                return frames
             frames.append(("endpoint.acoustic", {"pause_ms": PIPELINE["asr"].acoustic_ms}))
             frames.append(("asr.final", {"text": ev["text"], "confidence": None, "emotion": None, "speech_ms": ev.get("speech_ms")}))
+            # 连续对话：每次 final 刷新免唤醒窗（12 §五.2 对话态全程免唤醒）
+            self.conn.dialog_until = time.time() + CFG["wake"]["dialog_window_s"]
+            frames.append(("state", {"from": ENGINE_STATE["state"], "to": "listening", "reason": "asr-final-window"}))
+            ENGINE_STATE["state"] = "listening"
+        return frames
+
+    def _gate_enabled(self) -> bool:
+        return bool(KWS["enabled"] and KWS["gate"] and PIPELINE["asr"])
+
+    def _feed_block(self, block):
+        """音频帧路由（26 §C.3）：idle 只过 KWS 门；唤醒/免唤醒窗/对话态 → ASR 直通。"""
+        now = time.time()
+        in_window = now < self.conn.dialog_until
+        frames = []
+        if not self._gate_enabled() or not self.conn.wake_armed or in_window or ENGINE_STATE["state"] == "listening":
+            # KWS 未启用 / 主人关闭唤醒(全开档) / 窗内 / 对话态：ASR 直通
+            frames.extend(self._pipeline_event_frames(PIPELINE["asr"].feed(block)))
+        else:
+            ev = KWS["gate"].feed(block)
+            if ev:
+                COUNTERS["wake_fires"] += 1
+                self.conn.dialog_until = now + CFG["wake"]["dialog_window_s"]
+                ENGINE_STATE["state"] = "listening"
+                frames.append(("wake.detected", {"keyword": ev["keyword"], "confidence": None}))
+                frames.append(("state", {"from": "idle", "to": "listening", "reason": "wake"}))
+                # 当前块尾音可能带指令开头（「小寄小寄，今天……」）——同时喂 ASR，不漏字
+                frames.extend(self._pipeline_event_frames(PIPELINE["asr"].feed(block)))
         return frames
 
     async def feeder(self):
-        """麦克风帧 → 流水线（注入期间暂停消费，避免混音）。"""
+        """麦克风帧 → 路由（注入期间暂停消费，避免混音）。"""
         while True:
             if self.injecting:
                 await asyncio.sleep(0.02)
@@ -209,23 +251,29 @@ class Router:
                 block = await asyncio.wait_for(self.audio_q.get(), timeout=0.2)
             except asyncio.TimeoutError:
                 continue
-            frames = self._pipeline_event_frames(PIPELINE["asr"].feed(block))
-            for t, p in frames:
+            for t, p in self._feed_block(block):
                 await self.conn.send(t, p)
                 if t == "asr.final":
                     COUNTERS["asr_finals"] += 1
                     COUNTERS["asr_reals"] += 1
                     LAST_ASR.update(text=p["text"], at=time.time())
-                    await self.conn.emit_state("idle", "asr-final")
+
+    async def window_ticker(self):
+        """免唤醒窗到期巡检：listening 且窗过期 → 回 idle（12 §五.2 窗口语义）。"""
+        while True:
+            await asyncio.sleep(0.5)
+            if ENGINE_STATE["state"] == "listening" and time.time() > self.conn.dialog_until and not self.conn.speak_task:
+                ENGINE_STATE["state"] = "idle"
+                await self.conn.send("state", {"from": "listening", "to": "idle", "reason": "window-expired"})
 
     async def inject_wav(self, path, speed=0.0):
-        """WAV 注入：走同一条真流水线（确定性测试/自检通道）。"""
+        """WAV 注入：走同一条路由（含 KWS 门控），确定性测试/自检通道。"""
         self.injecting = True
         try:
             src = WavInjectSource(path, speed=speed)
 
             def feed(block):
-                self._pending_frames.extend(self._pipeline_event_frames(PIPELINE["asr"].feed(block)))
+                self._pending_frames.extend(self._feed_block(block))
 
             self._pending_frames = []
             await src.run(feed, lambda: None)
@@ -235,8 +283,6 @@ class Router:
                     COUNTERS["asr_finals"] += 1
                     COUNTERS["asr_reals"] += 1
                     LAST_ASR.update(text=p["text"], at=time.time())
-            if ENGINE_STATE["state"] == "listening":
-                await self.conn.emit_state("idle", "asr-final")
         except Exception as e:
             await self.conn.send("engine.error", {"code": "E_ASR_TIMEOUT", "message": f"WAV 注入失败：{e}", "degrade_hint": "retry"})
         finally:
@@ -257,9 +303,11 @@ async def handler(ws):
     conn.status_task = asyncio.create_task(status_loop())
     try:
         await conn.send("engine.ready", {
-            "models": (["funasr-streaming-paraformer-zh-en"] if PIPELINE["mode"] == "real" else []) + ["fake-tts"],
+            "models": (["funasr-streaming-paraformer-zh-en"] if PIPELINE["mode"] == "real" else [])
+                + (["kws-zipformer-wenetspeech-3.3M"] if KWS["enabled"] else []) + ["fake-tts"],
             "device": "cpu" if PIPELINE["mode"] == "real" else "skeleton",
             "asr_mode": PIPELINE["mode"],
+            "kws": "on" if KWS["enabled"] else "off",
             "mic": ("ok" if router.mic else (PIPELINE["mic_error"] or "off")),
         })
         await router.start()
@@ -399,6 +447,21 @@ class HttpApi(BaseHTTPRequestHandler):
         pass
 
 
+def init_kws():
+    """唤醒门控初始化（D3）。缺件则降级：门控关闭 = ASR 全开（D2 行为），WARN 不静默。"""
+    if not CFG["wake"].get("enabled", True):
+        print("[voice-engine] KWS disabled by config; routing = always-ASR", file=sys.stderr)
+        return
+    try:
+        KWS["gate"] = KwsGate(CFG["asr"]["models_dir"], CFG["wake"]["keywords_file"])
+        KWS["enabled"] = True
+        print(f"[voice-engine] KWS ready: zipformer-wenetspeech (int8) keywords={CFG['wake']['keywords_file']}", file=sys.stderr)
+    except Exception as e:
+        KWS["gate"] = None
+        KWS["enabled"] = False
+        print(f"[voice-engine] WARN: KWS unavailable ({e}); routing = always-ASR", file=sys.stderr)
+
+
 def init_pipeline():
     """启动即装真流水线（auto：模型不全则回退 fake 并大声说明）。"""
     mode = CFG["asr"].get("mode", "auto")
@@ -420,6 +483,8 @@ def init_pipeline():
 async def main():
     port, hport = CFG["port"], CFG["healthz_port"]
     init_pipeline()
+    if PIPELINE["mode"] == "real":
+        init_kws()
     server = ThreadingHTTPServer(("127.0.0.1", hport), HttpApi)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     async with websockets.serve(handler, "127.0.0.1", port, max_size=1 << 20):

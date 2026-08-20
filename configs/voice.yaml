@@ -12,9 +12,10 @@ asr:
 mic:
   enabled: true        # 引擎启动即开麦（失败只降级不致命,报 E_MIC_BUSY）
 wake:
-  engine: sherpa-onnx  # 26 §8.1 拍板：开放词表 KWS（D3 接入）
-  keywords_file: configs/kws-keywords.txt
-  window_s: 1.5
+  enabled: true        # 关=全开转写（调试档）；真关闭监听用 mic.set muted
+  engine: sherpa-onnx  # 26 §8.1 拍板：开放词表 KWS（D3 落地）
+  keywords_file: configs/kws-keywords.txt   # 相对仓库根；gen_keywords.py 生成
+  dialog_window_s: 30  # 免唤醒窗（12 §五.2）；窗内免唤醒，对话态每次 final 刷新
 voice_preset: 官方预设   # 决策点 1 拍板（2026-08-20）：官方预设先行，克隆后续
 hotwords: configs/hotwords.yaml
 auto_start: false      # 插件不自动拉引擎（26 §C.4）；手工 runtime/start-voice.ps1

@@ -60,6 +60,8 @@ async def main():
         f = await recv_until(ws, {"engine.ready"})
         mode = f["payload"].get("asr_mode")
         check("asr_mode == real", mode == "real", f"mode={mode} models={f['payload'].get('models')}")
+        # D3 起引擎有 KWS 门控：ASR 单测关唤醒直通（wake.set armed=false = 全开转写档）
+        await ws.send(json.dumps({"v": 1, "id": "w", "type": "wake.set", "ts": 0, "payload": {"armed": False}}))
 
         print("== 1. SAPI 中文 WAV（小寄自检/天气句）==")
         r, wall, ev = await inject_and_measure(ws, HERE / "test_zh.wav")

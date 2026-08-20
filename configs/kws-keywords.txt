@@ -1,5 +1,1 @@
-# kws-keywords.txt — sherpa-onnx 开放词表 KWS 唤醒词表（26 §8.1 定稿）
-# 格式：拼音token序列 :boosting #threshold @原文（token 由 sherpa-onnx-cli text2token --tokens-type ppinyin 生成）
-# D3 接入时以工具生成的精确 token 替换下面的手写占位；阈值经正负样本回放扫参定稿（12 §五.2）
-小寄小寄 :2.0 #0.6 @小寄小寄
-小寄 :1.5 #0.8 @小寄
+x iǎo j ì x iǎo j ì :1.2 #0.35 @小寄小寄
