@@ -1,9 +1,13 @@
 """
-hermit voice engine — 语音引擎进程骨架（MVP-1 M1-A D1，26 契约 C）。
+hermit voice engine — 语音引擎进程（MVP-1 M1-A，26 契约 C）。
 
-职责边界：麦克风/扬声器归本进程独占；DSH 侧只走 WS 协议 v1（契约 B）。
-D1 骨架：假 ASR / 假 TTS 回环 + debug.* 注入族（debug=true 时启用）。
-D2 起逐日替换为真件（26 §六）：D2 Fun-ASR-Nano / D3 sherpa-onnx KWS / D4 Qwen3-TTS。
+D2（2026-08-20）：真件 ASR 上线
+  - sherpa-onnx 流式 paraformer（中英）→ asr.partial / asr.final 真转写
+  - 声学端点 = recognizer rule2（尾静音 ≥ acoustic_ms）
+  - 麦克风源（sounddevice 回调线程）；WAV 注入源（debug.inject_wav，测试用）
+  - HTTP /v1/audio/transcriptions（OpenAI 兼容，raw WAV body，仅回环）
+  - 假 ASR 事件族（debug.inject_asr）保留在 debug 开关后，供协议回归测试
+  - 假 TTS 仍在位（D4 替换为 Qwen3-TTS）
 
 协议信封：{v:1, id, type, ts, payload}，JSON 文本帧，仅绑定 127.0.0.1。
 """
@@ -13,18 +17,25 @@ import signal
 import sys
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+import numpy as np
 import websockets
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from asr import AsrPipeline  # noqa: E402
+from audio_source import MicSource, WavInjectSource, load_wav_16k  # noqa: E402
 
 PROTOCOL_VERSION = 1
 HERE = Path(__file__).resolve().parent
 
-# ── 配置（configs/voice.yaml，缺失用默认）─────────────────────────────
+
 def load_config():
     cfg = {
         "port": 8300, "healthz_port": 8301, "debug": True,
+        "asr": {"mode": "auto", "models_dir": str(HERE.parent.parent / "models" / "voice")},
+        "mic": {"enabled": True},
         "endpoint": {"acoustic_ms": 600, "semantic_wait_ms": 1200},
         "fake": {"asr_partial_ms": 90, "asr_final_ms": 220, "tts_first_ms": 90, "tts_per_char_ms": 40},
     }
@@ -34,30 +45,41 @@ def load_config():
         if p.exists():
             data = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
             for k in ("port", "healthz_port", "debug"):
-                if k in data: cfg[k] = data[k]
-            if isinstance(data.get("endpoint"), dict): cfg["endpoint"].update(data["endpoint"])
-            if isinstance(data.get("fake"), dict): cfg["fake"].update(data["fake"])
-    except Exception as e:  # 配置坏了不挡启动，用默认
-        print(f"[voice-engine] config load fallback: {e}", file=sys.stderr)
+                if k in data:
+                    cfg[k] = data[k]
+            for k in ("asr", "mic", "endpoint", "fake"):
+                if isinstance(data.get(k), dict):
+                    cfg[k].update(data[k])
+        # 相对路径锚定仓库根（HERMIT/runtime/voice → HERMIT/），不受进程 CWD 影响
+        md = cfg["asr"].get("models_dir", "")
+        if md and not Path(md).is_absolute():
+            cfg["asr"]["models_dir"] = str((HERE.parent.parent / md).resolve())
+    except Exception as e:
+        print(f"[voice-engine] config fallback: {e}", file=sys.stderr)
     return cfg
 
+
 CFG = load_config()
-COUNTERS = {"connections": 0, "asr_finals": 0, "tts_finished": 0, "barge_ins": 0}
-ENGINE_STATE = {"state": "idle"}  # 引擎侧轮次状态（契约 C.3）
+COUNTERS = {"connections": 0, "asr_finals": 0, "asr_reals": 0, "tts_finished": 0, "barge_ins": 0, "http_transcriptions": 0}
+ENGINE_STATE = {"state": "idle"}
+START = time.time()
+PIPELINE = {"asr": None, "mode": "fake", "mic_error": None}  # 全局单例：WS 会话与 HTTP 端点共用
+ASR_LOCK = asyncio.Lock()
+LAST_ASR = {"text": "", "at": 0.0}
 
 
-def now_ms(): return int(time.time() * 1000)
+def now_ms():
+    return int(time.time() * 1000)
 
 
 class Conn:
-    """单连接会话态（DSH 是唯一客户端）。"""
+    """单 WS 连接会话态（DSH 是唯一客户端；HTTP 端点独立于此）。"""
 
     def __init__(self, ws):
         self.ws = ws
         self.wake_armed = True
         self.dialog_until = 0.0
-        self.acoustic_ms = CFG["endpoint"]["acoustic_ms"]
-        self.speak_task = None           # 当前 tts.speak 模拟任务
+        self.speak_task = None
         self.current_utterance = None
         self.status_task = None
 
@@ -67,7 +89,7 @@ class Conn:
 
     def set_state(self, to, reason):
         if to == ENGINE_STATE["state"]:
-            return
+            return None
         frm = ENGINE_STATE["state"]
         ENGINE_STATE["state"] = to
         return {"from": frm, "to": to, "reason": reason}
@@ -78,8 +100,8 @@ class Conn:
             await self.send("state", st)
 
 
+# ── 假 TTS（D1 保留件，D4 换 Qwen3-TTS）───────────────────────────────
 async def fake_speak(conn: Conn, p):
-    """假 TTS：tts.started → (可被打断) → tts.finished / tts.stopped（契约 B.2/B.3）。"""
     uid = p.get("utterance_id", "")
     text = str(p.get("text", ""))
     fake = CFG["fake"]
@@ -91,23 +113,21 @@ async def fake_speak(conn: Conn, p):
         await asyncio.sleep(duration)
         COUNTERS["tts_finished"] += 1
         await conn.send("tts.finished", {"utterance_id": uid, "duration_ms": int(duration * 1000)})
-        # 引擎侧回 idle（对话窗内回 listening）
         await conn.emit_state("listening" if time.time() < conn.dialog_until else "idle", "tts-finished")
     except asyncio.CancelledError:
-        played_ms = None
         reason = "barge_in" if getattr(conn.speak_task, "_barge", False) else "superseded"
         if reason == "barge_in":
             COUNTERS["barge_ins"] += 1
             await conn.send("tts.stopped", {"utterance_id": uid, "reason": "barge_in"})
-            await conn.send("barge_in.detected", {"yield_ms": 85, "tts_played_ms": played_ms})
+            await conn.send("barge_in.detected", {"yield_ms": 85, "tts_played_ms": None})
             await conn.emit_state("listening", "barge-in")
         else:
             await conn.send("tts.stopped", {"utterance_id": uid, "reason": "superseded"})
         raise
 
 
-async def inject_asr(conn: Conn, p):
-    """假 ASR 流水（契约 B.2 事件序）：vad.start → partial×2 → endpoint.acoustic → asr.final。"""
+# ── 假 ASR 事件族（debug 回归测试用；不触碰真流水线）──────────────────
+async def inject_asr_fake(conn: Conn, p):
     text = str(p.get("text", ""))
     fake = CFG["fake"]
     await conn.emit_state("listening", "vad-start")
@@ -117,23 +137,132 @@ async def inject_asr(conn: Conn, p):
     await asyncio.sleep(fake["asr_partial_ms"] / 1000)
     await conn.send("asr.partial", {"text": text})
     await asyncio.sleep(fake["asr_final_ms"] / 1000)
-    await conn.send("endpoint.acoustic", {"pause_ms": conn.acoustic_ms})
+    await conn.send("endpoint.acoustic", {"pause_ms": (PIPELINE["asr"].acoustic_ms if PIPELINE["asr"] else CFG["endpoint"]["acoustic_ms"])})
     COUNTERS["asr_finals"] += 1
     await conn.send("asr.final", {"text": text, "confidence": 0.97, "emotion": {"label": "neutral", "conf": 0.91}})
 
 
+# ── 真件音频路由（麦克风 + WAV 注入 → AsrPipeline → WS 帧）────────────
+class Router:
+    """把音频帧喂进真流水线，把事件翻译成协议帧。整个 DSH 连接一个实例。"""
+
+    def __init__(self, conn: Conn, loop: asyncio.AbstractEventLoop):
+        self.conn = conn
+        self.loop = loop
+        self.audio_q = asyncio.Queue(maxsize=200)
+        self.mic = None
+        self.injecting = False
+        self.feeder_task = None
+
+    async def start(self):
+        if PIPELINE["mode"] != "real" or not PIPELINE["asr"]:
+            return
+        if CFG["mic"]["enabled"]:
+            self.mic = MicSource(self.loop, self.audio_q)
+            if not self.mic.start():
+                PIPELINE["mic_error"] = self.mic.error
+                await self.conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风不可用：{self.mic.error}", "degrade_hint": "check_device"})
+                self.mic = None
+        self.feeder_task = asyncio.create_task(self.feeder())
+
+    async def stop(self):
+        if self.feeder_task:
+            self.feeder_task.cancel()
+            try:
+                await self.feeder_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self.feeder_task = None
+        if self.mic:
+            self.mic.stop()
+            self.mic = None
+        while not self.audio_q.empty():
+            try:
+                self.audio_q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+    def _pipeline_event_frames(self, ev):
+        """AsrPipeline 事件 → 协议帧列表（顺序敏感：endpoint 在 final 前）。"""
+        if not ev:
+            return []
+        frames = []
+        if ev["type"] == "start":
+            frames.append(("vad.start", {}))
+            if ENGINE_STATE["state"] == "idle":
+                frames.append(("state", {"from": "idle", "to": "listening", "reason": "vad-start"}))
+                ENGINE_STATE["state"] = "listening"
+        elif ev["type"] == "partial":
+            frames.append(("asr.partial", {"text": ev["text"]}))
+        elif ev["type"] == "final":
+            frames.append(("endpoint.acoustic", {"pause_ms": PIPELINE["asr"].acoustic_ms}))
+            frames.append(("asr.final", {"text": ev["text"], "confidence": None, "emotion": None, "speech_ms": ev.get("speech_ms")}))
+        return frames
+
+    async def feeder(self):
+        """麦克风帧 → 流水线（注入期间暂停消费，避免混音）。"""
+        while True:
+            if self.injecting:
+                await asyncio.sleep(0.02)
+                continue
+            try:
+                block = await asyncio.wait_for(self.audio_q.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            frames = self._pipeline_event_frames(PIPELINE["asr"].feed(block))
+            for t, p in frames:
+                await self.conn.send(t, p)
+                if t == "asr.final":
+                    COUNTERS["asr_finals"] += 1
+                    COUNTERS["asr_reals"] += 1
+                    LAST_ASR.update(text=p["text"], at=time.time())
+                    await self.conn.emit_state("idle", "asr-final")
+
+    async def inject_wav(self, path, speed=0.0):
+        """WAV 注入：走同一条真流水线（确定性测试/自检通道）。"""
+        self.injecting = True
+        try:
+            src = WavInjectSource(path, speed=speed)
+
+            def feed(block):
+                self._pending_frames.extend(self._pipeline_event_frames(PIPELINE["asr"].feed(block)))
+
+            self._pending_frames = []
+            await src.run(feed, lambda: None)
+            for t, p in self._pending_frames:
+                await self.conn.send(t, p)
+                if t == "asr.final":
+                    COUNTERS["asr_finals"] += 1
+                    COUNTERS["asr_reals"] += 1
+                    LAST_ASR.update(text=p["text"], at=time.time())
+            if ENGINE_STATE["state"] == "listening":
+                await self.conn.emit_state("idle", "asr-final")
+        except Exception as e:
+            await self.conn.send("engine.error", {"code": "E_ASR_TIMEOUT", "message": f"WAV 注入失败：{e}", "degrade_hint": "retry"})
+        finally:
+            self.injecting = False
+
+
 async def handler(ws):
     conn = Conn(ws)
+    router = Router(conn, asyncio.get_running_loop())
     COUNTERS["connections"] += 1
     print(f"[voice-engine] DSH connected ({COUNTERS['connections']})", file=sys.stderr)
 
     async def status_loop():
         while True:
             await asyncio.sleep(30)
-            await conn.send("engine.status", {"health": "ok", "gpu_mem": 0.0, "uptime_s": int(time.time() - START)})
+            await conn.send("engine.status", {"health": "ok", "mode": PIPELINE["mode"], "uptime_s": int(time.time() - START)})
 
     conn.status_task = asyncio.create_task(status_loop())
     try:
+        await conn.send("engine.ready", {
+            "models": (["funasr-streaming-paraformer-zh-en"] if PIPELINE["mode"] == "real" else []) + ["fake-tts"],
+            "device": "cpu" if PIPELINE["mode"] == "real" else "skeleton",
+            "asr_mode": PIPELINE["mode"],
+            "mic": ("ok" if router.mic else (PIPELINE["mic_error"] or "off")),
+        })
+        await router.start()
         async for raw in ws:
             try:
                 msg = json.loads(raw)
@@ -143,8 +272,6 @@ async def handler(ws):
             if mtype == "session.hello":
                 if msg.get("v") != PROTOCOL_VERSION:
                     await conn.send("engine.error", {"code": "E_PROTOCOL", "message": f"protocol v{msg.get('v')} != v{PROTOCOL_VERSION}", "degrade_hint": "restart_engine"}, _id=mid)
-                    continue
-                await conn.send("engine.ready", {"models": ["fake-asr", "fake-tts"], "device": "skeleton"}, _id=mid)
             elif mtype == "ping":
                 await conn.send("pong", {"t": p.get("t")}, _id=mid)
             elif mtype == "wake.set":
@@ -152,9 +279,10 @@ async def handler(ws):
             elif mtype == "dialog_window.open":
                 conn.dialog_until = time.time() + (p.get("ms", 30000) / 1000)
             elif mtype == "endpoint.set":
-                if p.get("acoustic_ms"): conn.acoustic_ms = int(p["acoustic_ms"])
+                if p.get("acoustic_ms") and PIPELINE["asr"]:
+                    PIPELINE["asr"].set_acoustic_ms(int(p["acoustic_ms"]))
             elif mtype == "tts.speak":
-                if conn.speak_task:  # 上一句未完：supersede（幂等语义由 utterance_id 侧保证）
+                if conn.speak_task:
                     conn.speak_task.cancel()
                     await asyncio.sleep(0)
                 conn.speak_task = asyncio.create_task(fake_speak(conn, p))
@@ -162,65 +290,141 @@ async def handler(ws):
                 if conn.speak_task:
                     conn.speak_task.cancel()
                     await asyncio.sleep(0)
-            elif mtype == "mic.set" or mtype == "asr.context":
-                pass  # 骨架空实现：D2 接真件时落热词/静音
+            elif mtype == "mic.set":
+                if PIPELINE["mode"] == "real":
+                    if p.get("muted") and router.mic:
+                        router.mic.stop(); router.mic = None
+                    elif not p.get("muted") and not router.mic:
+                        router.mic = MicSource(router.loop, router.audio_q)
+                        if not router.mic.start():
+                            await conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风恢复失败：{router.mic.error}", "degrade_hint": "check_device"})
+                            router.mic = None
+            elif mtype == "asr.context":
+                if p.get("hotwords"):
+                    # 流式 paraformer 不吃热词（26 §8 决策点 3 挂起）；收下并如实记录
+                    print(f"[voice-engine] hotwords accepted (no-op on paraformer): {p['hotwords']}", file=sys.stderr)
             elif mtype == "engine.shutdown":
                 await conn.send("state", conn.set_state("idle", "shutdown") or {})
                 await ws.close(code=1001)
                 print("[voice-engine] graceful shutdown", file=sys.stderr)
                 asyncio.get_running_loop().stop()
                 return
-            elif CFG["debug"] and mtype == "debug.inject_wake":
+            elif mtype == "debug.inject_wake" and CFG["debug"]:
                 if conn.wake_armed:
                     await conn.send("wake.detected", {"keyword": p.get("keyword", "小寄小寄"), "confidence": 0.95})
                     conn.dialog_until = time.time() + 30
-            elif CFG["debug"] and mtype == "debug.inject_asr":
-                await inject_asr(conn, p)
-            elif CFG["debug"] and mtype == "debug.inject_bargein":
+            elif mtype == "debug.inject_asr" and CFG["debug"]:
+                await inject_asr_fake(conn, p)
+            elif mtype == "debug.inject_bargein" and CFG["debug"]:
                 if conn.speak_task:
                     conn.speak_task._barge = True
                     conn.speak_task.cancel()
                     await asyncio.sleep(0)
-            elif mtype.startswith("debug."):
-                if not CFG["debug"]:
-                    await conn.send("engine.error", {"code": "E_PROTOCOL", "message": "debug family disabled", "degrade_hint": "restart_engine"}, _id=mid)
+            elif mtype == "debug.inject_wav" and CFG["debug"]:
+                await router.inject_wav(p.get("path", ""), float(p.get("speed", 0)))
     except websockets.ConnectionClosed:
         pass
     finally:
+        await router.stop()
         conn.status_task.cancel()
         if conn.speak_task:
             conn.speak_task.cancel()
-        # 设备释放点（骨架无设备；D2+ 在此释放麦克风/扬声器句柄）——A2 无残留
         ENGINE_STATE["state"] = "idle"
         print("[voice-engine] DSH disconnected; devices released, waiting for reconnect", file=sys.stderr)
 
 
-# ── healthz（契约 B.4 最小面；OpenAI 兼容端点随 D2 真件落）────────────
-class Healthz(BaseHTTPRequestHandler):
+# ── HTTP：healthz / metrics / OpenAI 兼容转写（仅回环）────────────────
+def one_shot_transcribe(wav_bytes: bytes) -> dict:
+    """整段 WAV → 文本（复用全局流水线；阻塞调用，跑在线程池）。"""
+    import tempfile, os
+    if PIPELINE["mode"] != "real" or not PIPELINE["asr"]:
+        return {"error": {"message": "real ASR not available", "type": "engine_error", "code": 503}}
+    tmp = None
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.write(wav_bytes); tmp.close()
+        samples, rate = load_wav_16k(tmp.name)
+        pipe = PIPELINE["asr"]
+        ev = None
+        CHUNK = 16000 * 32 // 1000
+        for i in range(0, len(samples), CHUNK):
+            ev = pipe.feed(samples[i:i + CHUNK]) or ev
+            if ev and ev["type"] == "final":
+                break
+        if not (ev and ev["type"] == "final"):
+            ev = pipe.force_final()
+        return {"text": (ev or {}).get("text", ""), "model": "funasr-streaming-paraformer-zh-en"}
+    except Exception as e:
+        return {"error": {"message": str(e), "type": "invalid_request_error", "code": 400}}
+    finally:
+        if tmp:
+            try: os.unlink(tmp.name)
+            except OSError: pass
+
+
+class HttpApi(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _json(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         if self.path == "/healthz":
-            body = json.dumps({"ok": True, "state": ENGINE_STATE["state"], "uptime_s": int(time.time() - START)}).encode()
-            self.send_response(200); self.send_header("Content-Type", "application/json"); self.end_headers(); self.wfile.write(body)
+            self._json(200, {"ok": True, "state": ENGINE_STATE["state"], "asr_mode": PIPELINE["mode"], "uptime_s": int(time.time() - START)})
         elif self.path == "/metrics":
-            lines = [f'voice_{k} {v}' for k, v in COUNTERS.items()] + [f'voice_state{{s="{ENGINE_STATE["state"]}"}} 1']
+            lines = [f"voice_{k} {v}" for k, v in COUNTERS.items()] + [f'voice_state{{s="{ENGINE_STATE["state"]}"}} 1']
             body = ("\n".join(lines) + "\n").encode()
-            self.send_response(200); self.send_header("Content-Type", "text/plain; version=0.0.1"); self.end_headers(); self.wfile.write(body)
+            self.send_response(200); self.send_header("Content-Type", "text/plain; version=0.0.1")
+            self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
         else:
-            self.send_response(404); self.end_headers()
+            self._json(404, {"error": "not found"})
 
-    def log_message(self, *a): pass
+    def do_POST(self):
+        if self.path == "/v1/audio/transcriptions":
+            length = int(self.headers.get("Content-Length") or 0)
+            if length <= 0 or length > 50 * 1024 * 1024:
+                return self._json(400, {"error": {"message": "body must be raw WAV bytes (1~50MB)", "code": 400}})
+            wav_bytes = self.rfile.read(length)
+            COUNTERS["http_transcriptions"] += 1
+            result = one_shot_transcribe(wav_bytes)
+            return self._json(503 if result.get("error", {}).get("code") == 503 else 200, result)
+        return self._json(404, {"error": "not found"})
+
+    def log_message(self, *a):
+        pass
 
 
-START = time.time()
+def init_pipeline():
+    """启动即装真流水线（auto：模型不全则回退 fake 并大声说明）。"""
+    mode = CFG["asr"].get("mode", "auto")
+    if mode == "fake":
+        return
+    try:
+        PIPELINE["asr"] = AsrPipeline(CFG["asr"]["models_dir"], acoustic_ms=CFG["endpoint"]["acoustic_ms"])
+        PIPELINE["mode"] = "real"
+        print(f"[voice-engine] real ASR ready: funasr-streaming-paraformer (cpu) from {CFG['asr']['models_dir']}", file=sys.stderr)
+    except Exception as e:
+        if mode == "real":
+            print(f"[voice-engine] FATAL: asr.mode=real but pipeline failed: {e}", file=sys.stderr)
+            raise
+        PIPELINE["asr"] = None
+        PIPELINE["mode"] = "fake"
+        print(f"[voice-engine] WARN: real ASR unavailable ({e}); falling back to FAKE mode", file=sys.stderr)
 
 
 async def main():
     port, hport = CFG["port"], CFG["healthz_port"]
-    hb = threading.Thread(target=lambda: HTTPServer(("127.0.0.1", hport), Healthz).serve_forever(), daemon=True)
-    hb.start()
+    init_pipeline()
+    server = ThreadingHTTPServer(("127.0.0.1", hport), HttpApi)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
     async with websockets.serve(handler, "127.0.0.1", port, max_size=1 << 20):
-        print(f"[voice-engine] skeleton up  ws=ws://127.0.0.1:{port}/voice  healthz=127.0.0.1:{hport}/healthz  debug={CFG['debug']}", file=sys.stderr)
-        await asyncio.Future()  # run until shutdown
+        print(f"[voice-engine] up  ws=ws://127.0.0.1:{port}/voice  http=127.0.0.1:{hport}  asr={PIPELINE['mode']}  debug={CFG['debug']}", file=sys.stderr)
+        await asyncio.Future()
 
 
 if __name__ == "__main__":

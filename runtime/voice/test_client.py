@@ -49,6 +49,8 @@ async def main(url):
         await send("session.hello", {"version": 1, "caps": ["turn-machine", "speak-priority"]})
         f = await recv_until(ws, {"engine.ready", "engine.error"})
         check("hello→engine.ready", f and f["type"] == "engine.ready", f"models={f['payload'].get('models') if f else '—'}")
+        # 真模式下静音麦克风：协议回归要确定性，不吃环境音（结束前恢复）
+        await send("mic.set", {"muted": True})
 
         print("== 2. heartbeat ==")
         await send("ping", {"t": 1})
@@ -101,6 +103,8 @@ async def main(url):
         await send("tts.stop", {"reason": "api"})
         f = await recv_until(ws, {"tts.stopped"})
         check("tts.stopped(superseded)", f is not None and f["payload"].get("reason") == "superseded")
+
+        await send("mic.set", {"muted": False})
 
     total = time.time() - t0
     print(f"\n===== {len(PASS)} passed / {len(FAIL)} failed ({total:.1f}s) =====")
