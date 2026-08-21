@@ -13,9 +13,12 @@
 import { Service } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import { randomUUID } from 'node:crypto'
+import { spawn } from 'node:child_process'
+import net from 'node:net'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
 
 export const name = 'hermit-voice'
@@ -24,10 +27,16 @@ export const inject = ['tools']
 export const Config = z.object({
   port: z.number().default(8300),
   url: z.string().default(''),
+  // 引擎随会话幂等自启（26 §C.4 auto_start 落地）：端口探测已跑则不重复拉起
+  autoStart: z.boolean().default(true),
+  enginePython: z.string().default(''),   // 覆盖默认 .venv python 路径
+  engineServer: z.string().default(''),   // 覆盖默认 server.py 路径
 })
 
 const OVERLAY_FILE = path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'hermit-voice-config.json')
 const MAX_TURNS = 50
+// 插件 lib/index.js → 仓库根（packages/hermit-voice/lib → 3 级上）
+const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', '..', '..')
 // 口语句尾拖延词（12 §二 语义层，零 LLM）：命中则延长端点等待至 1200ms，避免抢切
 const SEMANTIC_EXTEND_RE = /(那个|这个|然后|就是|嗯|额|呃|啊|怎么说|我想想|等一下|等等|还有|或者说|然后呢|所以呢|就是那个)\s*$/
 
@@ -41,6 +50,14 @@ function pct(list, p) {
   if (!list.length) return null
   const s = [...list].sort((a, b) => a - b)
   return Math.round(s[Math.min(s.length - 1, Math.floor(s.length * p))])
+}
+function portOpen(port) {
+  return new Promise((resolve) => {
+    const s = net.connect({ port, host: '127.0.0.1' })
+    s.once('connect', () => { s.destroy(); resolve(true) })
+    s.once('error', () => { s.destroy(); resolve(false) })
+    s.setTimeout(600, () => { s.destroy(); resolve(false) })
+  })
 }
 
 /**
@@ -75,10 +92,35 @@ class VoiceService extends Service {
       this.ctx.logger?.warn?.('hermit-voice: 运行时无全局 WebSocket，语音桥不可用（降级 D3 纯文本）')
       return
     }
+    this.ensureEngine()   // 幂等自启：端口探测已跑则不重复拉起
     this.ctx.effect(() => {
       this.connect()
       return () => this.teardown()
     }, 'hermit:voice-bridge')
+  }
+
+  /** 幂等拉起语音引擎（26 §C.4 auto_start 落地）。detached 子进程，随 dsh web 生命周期外独立存活。 */
+  ensureEngine() {
+    if (!this.config.autoStart || this._ensureDone) return
+    this._ensureDone = true
+    const python = this.config.enginePython
+      || path.join(REPO_ROOT, 'runtime', 'voice', '.venv', 'Scripts', 'python.exe')
+    const server = this.config.engineServer
+      || path.join(REPO_ROOT, 'runtime', 'voice', 'server.py')
+    portOpen(this.config.port).then((open) => {
+      if (open) return  // 引擎已在跑（幂等，双实例只起一个）
+      if (!fs.existsSync(python) || !fs.existsSync(server)) {
+        this.ctx.logger?.warn?.('hermit-voice: 引擎脚本缺失，跳过自动拉起', server)
+        return
+      }
+      try {
+        const child = spawn(python, [server], { detached: true, stdio: 'ignore', windowsHide: true, cwd: path.dirname(server) })
+        child.unref()
+        this.ctx.logger?.info?.('hermit-voice: 幂等自动拉起语音引擎', server)
+      } catch (e) {
+        this.ctx.logger?.warn?.('hermit-voice: 引擎拉起失败', e?.message ?? String(e))
+      }
+    })
   }
 
   /* ── 桥接（26 §B）────────────────────────────────────────── */
