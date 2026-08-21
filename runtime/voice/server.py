@@ -83,6 +83,17 @@ def now_ms():
     return int(time.time() * 1000)
 
 
+def resolve_mic_device():
+    """解析 mic.device 配置：auto/空→系统默认(None)；数字→指定输入设备 index。"""
+    v = CFG["mic"].get("device")
+    if v is None or v == "" or v == "auto":
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
 class Conn:
     """单 WS 连接会话态（DSH 是唯一客户端；HTTP 端点独立于此）。"""
 
@@ -255,7 +266,7 @@ class Router:
         if PIPELINE["mode"] != "real" or not PIPELINE["asr"]:
             return
         if CFG["mic"]["enabled"]:
-            self.mic = MicSource(self.loop, self.audio_q)
+            self.mic = MicSource(self.loop, self.audio_q, device=resolve_mic_device())
             if not self.mic.start():
                 PIPELINE["mic_error"] = self.mic.error
                 await self.conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风不可用：{self.mic.error}", "degrade_hint": "check_device"})
@@ -493,7 +504,10 @@ async def handler(ws):
             "mic": ("ok" if router.mic else (PIPELINE["mic_error"] or "off")),
         })
         if router.mic:
-            print(f"[voice-engine] mic STARTED ok (device via sounddevice default)", file=sys.stderr)
+            import sounddevice as _sd
+            _dev = resolve_mic_device()
+            _devname = _sd.query_devices(_dev)["name"] if _dev is not None else "系统默认"
+            print(f"[voice-engine] mic STARTED ok (device=[{_dev if _dev is not None else 'default'}] {_devname})", file=sys.stderr)
         else:
             print(f"[voice-engine] mic NOT started: {PIPELINE['mic_error'] or 'disabled'}", file=sys.stderr)
         async for raw in ws:
@@ -534,7 +548,7 @@ async def handler(ws):
                     if p.get("muted") and router.mic:
                         router.mic.stop(); router.mic = None
                     elif not p.get("muted") and not router.mic:
-                        router.mic = MicSource(router.loop, router.audio_q)
+                        router.mic = MicSource(router.loop, router.audio_q, device=resolve_mic_device())
                         if not router.mic.start():
                             await conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风恢复失败：{router.mic.error}", "degrade_hint": "check_device"})
                             router.mic = None

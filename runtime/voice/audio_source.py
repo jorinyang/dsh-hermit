@@ -85,10 +85,11 @@ class WavInjectSource:
 class MicSource:
     """真麦克风源（sounddevice 回调线程 → asyncio）。找不到设备不抛异常，返回失败原因。"""
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, chunk_ms: int = 32):
+    def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue, chunk_ms: int = 32, device=None):
         self.loop = loop
         self.queue = queue
         self.chunk = int(16000 * chunk_ms / 1000)
+        self.device = device          # 指定输入设备 index；None=系统默认
         self._stream = None
         self.error = None
 
@@ -97,7 +98,7 @@ class MicSource:
             import sounddevice as sd
             self._stream = sd.InputStream(
                 samplerate=16000, channels=1, dtype="int16",
-                blocksize=self.chunk, callback=self._cb)
+                blocksize=self.chunk, callback=self._cb, device=self.device)
             self._stream.start()
             return True
         except Exception as e:  # 无麦克风/驱动问题：降级，不致命
