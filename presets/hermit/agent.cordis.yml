@@ -70,12 +70,19 @@
 # budget_status 由 hermit-core 内部注册（与 dispatch_task/task_status 同包，消除 mount 不确定性）
 
 # ── hermit 语音通道（MVP-1 M1-A）：ctx.voice 服务 + voice_* 工具 ──────────────
-# 桥接外部语音引擎进程（runtime/start-voice.ps1 启动，仅回环 127.0.0.1:8300）。
+# hermit-voice 发布 ctx.voice 服务 → 必须 isolate realm（否则多会话冲突 + 挂载审计拒绝）。
+# 桥接外部语音引擎进程（runtime/start-voice.ps1，仅回环 127.0.0.1:8300）。
 # 引擎不在时插件照常挂载、自动降级纯文本（26 §五 D3 档）——人格与工具不变。
-- id: hermit-voice
-  name: 'hermit-voice'
+- id: voice
+  name: cordis:group
+  group: true
+  isolate:
+    voice: true
   config:
-    port: 8300
+    - id: hermit-voice
+      name: 'hermit-voice'
+      config:
+        port: 8300
 
 # ── shell ───────────────────────────────────────────────────────────────────
 - id: tool-bash
