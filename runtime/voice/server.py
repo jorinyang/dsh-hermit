@@ -400,6 +400,9 @@ class Router:
                     COUNTERS["asr_finals"] += 1
                     COUNTERS["asr_reals"] += 1
                     LAST_ASR.update(text=p["text"], at=time.time())
+                    print(f"[voice-engine] ASR final: 「{p['text']}」", file=sys.stderr)
+                elif t == "wake.detected":
+                    print(f"[voice-engine] WAKE: {p.get('keyword')}", file=sys.stderr)
 
     async def window_ticker(self):
         """免唤醒窗到期巡检：listening 且窗过期 → 回 idle（12 §五.2 窗口语义）。"""
@@ -476,6 +479,8 @@ async def handler(ws):
 
     conn.status_task = asyncio.create_task(status_loop())
     try:
+        # 先启动麦克风/路由，再上报 engine.ready，否则 mic 字段永远是 off（时序 bug）
+        await router.start()
         await conn.send("engine.ready", {
             "models": (["funasr-streaming-paraformer-zh-en"] if PIPELINE["mode"] == "real" else [])
                 + (["kws-zipformer-wenetspeech-3.3M"] if KWS["enabled"] else [])
@@ -487,7 +492,10 @@ async def handler(ws):
             "barge_vad": "on" if BARGIN["vad"] else "off",
             "mic": ("ok" if router.mic else (PIPELINE["mic_error"] or "off")),
         })
-        await router.start()
+        if router.mic:
+            print(f"[voice-engine] mic STARTED ok (device via sounddevice default)", file=sys.stderr)
+        else:
+            print(f"[voice-engine] mic NOT started: {PIPELINE['mic_error'] or 'disabled'}", file=sys.stderr)
         async for raw in ws:
             try:
                 msg = json.loads(raw)
