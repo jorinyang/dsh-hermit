@@ -12,6 +12,7 @@
  */
 import { Service } from '@deepseek-ai/cordis'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
 import { randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import net from 'node:net'
@@ -86,6 +87,7 @@ class VoiceService extends Service {
     this.lastE2e = null
     this.pendingUtterance = null
     this.wakeArmed = true
+    this.agent = null   // 本会话的 Agent（agent/created 作用域过滤事件捕获，用于转写注入）
 
     if (typeof WebSocket !== 'function') {
       this.engineHealth = 'unsupported'
@@ -93,6 +95,11 @@ class VoiceService extends Service {
       return
     }
     this.ensureEngine()   // 幂等自启：端口探测已跑则不重复拉起
+    // 捕获本会话 agent（agent/created 作用域过滤：agent-scoped 监听只收到自己的 agent）
+    this.ctx.effect(() => this.ctx.on('agent/created', ({ agent }) => {
+      this.agent = agent
+      this.ctx.logger?.info?.('hermit-voice: 捕获本会话 agent', String(agent.id))
+    }), 'hermit:agent-ref')
     this.ctx.effect(() => {
       this.connect()
       return () => this.teardown()
@@ -228,6 +235,7 @@ class VoiceService extends Service {
           text: p.text, confidence: p.confidence, emotion: p.emotion,
           asr_ms: this.asrStart ? Date.now() - this.asrStart : (p.asr_ms ?? null), ts: f.ts,
         })
+        this.injectTranscript(p.text)   // 26 §A.4「听→注入」：转写文本注入本会话，触发小寄应答
         break
       case 'endpoint.acoustic':
         // 语义端点旁路（12 §二 语义层，D5）：零 LLM 拖延词规则——尾句未完则延长等待至 1200ms
@@ -310,6 +318,27 @@ class VoiceService extends Service {
   }
 
   stopSpeaking(reason = 'api') { this.send('tts.stop', { reason }) }
+
+  /** 26 §A.4「听→注入」：转写文本作为用户消息注入本会话，触发小寄应答。 */
+  injectTranscript(text) {
+    const t = String(text ?? '').trim()
+    if (!t) return
+    if (!this.agent) {
+      this.ctx.logger?.warn?.('hermit-voice: 未捕获 agent，转写未注入', t)
+      return
+    }
+    const message = createUserMessage({
+      content: [{ type: 'text', text: t }],
+      source: { kind: 'plugin', plugin: 'hermit-voice' },
+    })
+    try {
+      if (this.agent.status === 'idle') this.agent.followup(message)
+      else this.agent.steer(message)
+      this.ctx.logger?.info?.('hermit-voice: 转写注入', t)
+    } catch (e) {
+      this.ctx.logger?.warn?.('hermit-voice: 转写注入失败', e?.message ?? String(e))
+    }
+  }
 
   armWake(armed, sensitivity) {
     this.wakeArmed = !!armed
