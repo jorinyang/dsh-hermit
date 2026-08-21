@@ -323,6 +323,14 @@ class VoiceService extends Service {
   injectTranscript(text) {
     const t = String(text ?? '').trim()
     if (!t) return
+    // 兜底：agent/created 事件若因 isolate realm 未送达，用 agents 服务找本会话 agent
+    if (!this.agent) {
+      const agents = this.ctx.get('agents')
+      if (agents) {
+        const candidate = agents.currentInitiator() || agents.roots()[0] || agents.list()[0]
+        if (candidate) this.agent = candidate
+      }
+    }
     if (!this.agent) {
       this.ctx.logger?.warn?.('hermit-voice: 未捕获 agent，转写未注入', t)
       return
