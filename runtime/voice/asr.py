@@ -35,6 +35,8 @@ class AsrPipeline:
         self.models_dir = str(models_dir)
         self.sample_rate = sample_rate
         self.acoustic_ms = max(200, int(acoustic_ms))
+        self.semantic_mode = False      # 语义端点旁路（12 §二 语义层）：声学端点后保持，等 accept/extend
+        self.semantic_wait_ms = 1200
         self._check_models()
         self._build()
         self._new_turn()
@@ -72,6 +74,7 @@ class AsrPipeline:
         self.speech_ms = 0
         self._had_partial = False
         self._last_partial = ""
+        self._ep_emitted = False   # 语义模式：本轮是否已发声学端点 cue
         self.stream = self.recognizer.create_stream()
 
     def set_acoustic_ms(self, ms: int):
@@ -79,6 +82,11 @@ class AsrPipeline:
         self.acoustic_ms = max(200, int(ms))
         self._build()
         self._new_turn()
+
+    def set_semantic(self, mode: bool, wait_ms: int = 1200):
+        """语义端点旁路开关（DSH 插件经 endpoint.set 下发）。关=声学端点即 finalize（D2 行为）。"""
+        self.semantic_mode = bool(mode)
+        self.semantic_wait_ms = max(600, int(wait_ms))
 
     def feed(self, chunk: np.ndarray):
         """喂 16k mono 帧（int16 或 float32）。返回事件 dict 或 None。"""
@@ -101,6 +109,12 @@ class AsrPipeline:
             ev = {"type": "partial", "text": text}
 
         if self.recognizer.is_endpoint(self.stream):
+            if self.semantic_mode:
+                # 声学端点 cue：保持（不 finalize），等 DSH 语义复判（endpoint.accept/extend）或超时
+                if not self._ep_emitted:
+                    self._ep_emitted = True
+                    return {"type": "endpoint_acoustic", "text": text.strip(), "pause_ms": self.acoustic_ms}
+                return ev
             final = (self.recognizer.get_result(self.stream) or "").strip()
             ms = self.speech_ms
             self._new_turn()

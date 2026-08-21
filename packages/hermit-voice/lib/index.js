@@ -28,6 +28,8 @@ export const Config = z.object({
 
 const OVERLAY_FILE = path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'hermit-voice-config.json')
 const MAX_TURNS = 50
+// 口语句尾拖延词（12 §二 语义层，零 LLM）：命中则延长端点等待至 1200ms，避免抢切
+const SEMANTIC_EXTEND_RE = /(那个|这个|然后|就是|嗯|额|呃|啊|怎么说|我想想|等一下|等等|还有|或者说|然后呢|所以呢|就是那个)\s*$/
 
 function loadOverlay() {
   try { return JSON.parse(fs.readFileSync(OVERLAY_FILE, 'utf8')) } catch { return {} }
@@ -151,9 +153,9 @@ class VoiceService extends Service {
         this.ready = true
         this.engineHealth = 'ok'
         this.degrade = 0
-        // 重新协商：恢复唤醒态 + 端点阈值（overlay 持久化的用户偏好）
+        // 重新协商：恢复唤醒态 + 端点阈值（overlay 持久化的用户偏好）+ 启用语义端点旁路
         this.send('wake.set', { armed: this.wakeArmed })
-        this.send('endpoint.set', { acoustic_ms: this.overlay.acoustic_ms ?? 600 })
+        this.send('endpoint.set', { acoustic_ms: this.overlay.acoustic_ms ?? 600, semantic_mode: true, semantic_wait_ms: 1200 })
         this.emitEngineStatus('ok')
         this.ctx.logger?.info?.('hermit-voice: 引擎就绪', JSON.stringify(p.models ?? []))
         break
@@ -186,7 +188,9 @@ class VoiceService extends Service {
         })
         break
       case 'endpoint.acoustic':
-        // 语义端点旁路（12 §二）M1-A D5 接入；骨架期直接采信声学端点
+        // 语义端点旁路（12 §二 语义层，D5）：零 LLM 拖延词规则——尾句未完则延长等待至 1200ms
+        if (SEMANTIC_EXTEND_RE.test(String(p.text ?? ''))) this.send('endpoint.extend', {})
+        else this.send('endpoint.accept', {})
         break
       case 'tts.started':
         this.speakSentAt = this.speakSentAt || f.ts

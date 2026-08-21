@@ -38,7 +38,7 @@ def load_config():
         "port": 8300, "healthz_port": 8301, "debug": True,
         "asr": {"mode": "auto", "models_dir": str(HERE.parent.parent / "models" / "voice")},
         "mic": {"enabled": True},
-        "endpoint": {"acoustic_ms": 600, "semantic_wait_ms": 1200},
+        "endpoint": {"acoustic_ms": 600, "semantic_wait_ms": 1200, "semantic_enabled": False},
         "wake": {"enabled": True, "engine": "sherpa-onnx", "keywords_file": "configs/kws-keywords.txt", "dialog_window_s": 30},
         "tts": {"voice": "zf_xiaoni", "speed": 1.0},
         "fake": {"asr_partial_ms": 90, "asr_final_ms": 220, "tts_first_ms": 90, "tts_per_char_ms": 40},
@@ -249,6 +249,7 @@ class Router:
         self.mic = None
         self.injecting = False
         self.feeder_task = None
+        self._ep_timer = None   # 语义端点保持定时器（endpoint.acoustic → accept/extend/超时）
 
     async def start(self):
         if PIPELINE["mode"] != "real" or not PIPELINE["asr"]:
@@ -272,6 +273,7 @@ class Router:
                     pass
         self.feeder_task = None
         self.ticker_task = None
+        self._cancel_ep_timer()
         if self.mic:
             self.mic.stop()
             self.mic = None
@@ -282,30 +284,62 @@ class Router:
                 break
 
     def _pipeline_event_frames(self, ev):
-        """AsrPipeline 事件 → 协议帧列表（顺序敏感：endpoint 在 final 前；state 迁移内联）。"""
+        """AsrPipeline 事件 → 协议帧列表（顺序敏感；语义模式：endpoint_acoustic 与 final 分离）。"""
         if not ev:
             return []
         frames = []
-        if ev["type"] == "start":
+        t = ev["type"]
+        if t == "start":
             frames.append(("vad.start", {}))
             if ENGINE_STATE["state"] == "idle":
                 ENGINE_STATE["state"] = "listening"
                 frames.append(("state", {"from": "idle", "to": "listening", "reason": "vad-start"}))
-        elif ev["type"] == "partial":
+        elif t == "partial":
             frames.append(("asr.partial", {"text": ev["text"]}))
-        elif ev["type"] == "final":
+        elif t == "endpoint_acoustic":
+            frames.append(("endpoint.acoustic", {"text": ev["text"], "pause_ms": ev["pause_ms"]}))
+            self._start_ep_timer()
+        elif t == "final":
             if not ev.get("text"):
-                # 纯唤醒词召唤/噪声端点：空文本不送 DSH（12 §五.3 拒识语义）
                 if ENGINE_STATE["state"] == "listening":
                     frames.append(("state", {"from": "listening", "to": "listening", "reason": "empty-final"}))
                 return frames
-            frames.append(("endpoint.acoustic", {"pause_ms": PIPELINE["asr"].acoustic_ms}))
             frames.append(("asr.final", {"text": ev["text"], "confidence": None, "emotion": None, "speech_ms": ev.get("speech_ms")}))
-            # 连续对话：每次 final 刷新免唤醒窗（12 §五.2 对话态全程免唤醒）
             self.conn.dialog_until = time.time() + CFG["wake"]["dialog_window_s"]
             frames.append(("state", {"from": ENGINE_STATE["state"], "to": "listening", "reason": "asr-final-window"}))
             ENGINE_STATE["state"] = "listening"
         return frames
+
+    def _start_ep_timer(self):
+        self._cancel_ep_timer()
+        wait_s = CFG["endpoint"].get("semantic_wait_ms", 1200) / 1000.0
+        self._ep_timer = self.loop.call_later(wait_s, self._finalize_endpoint)
+
+    def _cancel_ep_timer(self):
+        if self._ep_timer:
+            self._ep_timer.cancel()
+            self._ep_timer = None
+
+    def _finalize_endpoint(self):
+        self._ep_timer = None
+        ev = PIPELINE["asr"].force_final()
+        if ev:
+            for t, p in self._pipeline_event_frames(ev):
+                asyncio.ensure_future(self.conn.send(t, p))
+                if t == "asr.final":
+                    COUNTERS["asr_finals"] += 1
+                    COUNTERS["asr_reals"] += 1
+                    LAST_ASR.update(text=p["text"], at=time.time())
+
+    def accept_endpoint(self):
+        """DSH 语义复判「说完了」→ 立即 finalize。"""
+        self._cancel_ep_timer()
+        self._finalize_endpoint()
+
+    def extend_endpoint(self):
+        """DSH 语义复判「没说完」（拖延词）→ 延长等待至 semantic_wait_ms。"""
+        self._cancel_ep_timer()
+        self._start_ep_timer()
 
     def _gate_enabled(self) -> bool:
         return bool(KWS["enabled"] and KWS["gate"] and PIPELINE["asr"])
@@ -431,6 +465,9 @@ async def handler(ws):
     router = Router(conn, asyncio.get_running_loop())
     COUNTERS["connections"] += 1
     print(f"[voice-engine] DSH connected ({COUNTERS['connections']})", file=sys.stderr)
+    # 语义模式是全局管线状态：每连接复位到 config 默认，避免漏给「不响应 endpoint.acoustic」的原始客户端
+    if PIPELINE["asr"]:
+        PIPELINE["asr"].set_semantic(CFG["endpoint"].get("semantic_enabled", False))
 
     async def status_loop():
         while True:
@@ -469,6 +506,12 @@ async def handler(ws):
             elif mtype == "endpoint.set":
                 if p.get("acoustic_ms") and PIPELINE["asr"]:
                     PIPELINE["asr"].set_acoustic_ms(int(p["acoustic_ms"]))
+                if "semantic_mode" in p and PIPELINE["asr"]:
+                    PIPELINE["asr"].set_semantic(bool(p["semantic_mode"]), int(p.get("semantic_wait_ms", 1200)))
+            elif mtype == "endpoint.accept":
+                router.accept_endpoint()
+            elif mtype == "endpoint.extend":
+                router.extend_endpoint()
             elif mtype == "tts.speak":
                 if conn.speak_task:
                     conn.speak_task.cancel()
