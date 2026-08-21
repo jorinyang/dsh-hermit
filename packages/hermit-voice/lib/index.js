@@ -202,6 +202,7 @@ class VoiceService extends Service {
         this.ready = true
         this.engineHealth = 'ok'
         this.degrade = 0
+        this.modules = { mic: p.mic ?? 'off', kws: p.kws ?? 'off', tts: p.tts ?? 'off', barge_vad: p.barge_vad ?? 'off', asr_mode: p.asr_mode ?? 'fake', models: p.models ?? [] }
         // 重新协商：恢复唤醒态 + 端点阈值（overlay 持久化的用户偏好）+ 启用语义端点旁路
         this.send('wake.set', { armed: this.wakeArmed })
         this.send('endpoint.set', { acoustic_ms: this.overlay.acoustic_ms ?? 600, semantic_mode: true, semantic_wait_ms: 1200 })
@@ -363,6 +364,7 @@ class VoiceService extends Service {
     return {
       state: this.state,
       engine: { health: this.engineHealth, ready: this.ready, degrade: this.degrade, url: this.engineUrl },
+      modules: this.modules ?? null,
       metrics: { turns: this.turns.length, p50: pct(e2e, 0.5), p95: pct(e2e, 0.95), lastE2e: this.lastE2e },
     }
   }
@@ -461,4 +463,20 @@ export function apply(ctx, config) {
     const d3 = ctx.tools.register(voiceSelftest)
     return () => { d1(); d2(); d3() }
   }, 'hermit:voice-tools')
+
+  // 状态路由（供 client 侧边栏指示器轮询，同源 /hermit-voice/status）
+  const webServer = ctx.get('webServer')
+  if (webServer) {
+    ctx.effect(() => webServer.register({
+      kind: 'exact',
+      path: '/hermit-voice/status',
+      handler: async (_req, res) => {
+        const v = ctx.get('voice')
+        const s = v ? v.status() : { state: 'unknown', engine: { health: 'missing', ready: false, degrade: 3 }, metrics: {} }
+        const body = JSON.stringify({ ok: true, voice: s })
+        res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+        res.end(body)
+      },
+    }), 'hermit:status-route')
+  }
 }
