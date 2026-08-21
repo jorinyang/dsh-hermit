@@ -71,7 +71,7 @@ CFG = load_config()
 COUNTERS = {"connections": 0, "asr_finals": 0, "asr_reals": 0, "tts_finished": 0, "barge_ins": 0, "http_transcriptions": 0, "wake_fires": 0}
 ENGINE_STATE = {"state": "idle"}
 START = time.time()
-PIPELINE = {"asr": None, "mode": "fake", "mic_error": None}  # 全局单例：WS 会话与 HTTP 端点共用
+PIPELINE = {"asr": None, "mode": "fake", "mic_error": None, "mic_active": False}  # 全局单例：WS 会话与 HTTP 端点共用
 KWS = {"gate": None, "enabled": False}  # 唤醒门控单例（D3）
 TTS = {"engine": None, "ready": False}  # TTS 引擎单例（D4）
 BARGIN = {"vad": None}  # barge-in 静音检测 VAD（silero，D4）
@@ -269,8 +269,11 @@ class Router:
             self.mic = MicSource(self.loop, self.audio_q, device=resolve_mic_device())
             if not self.mic.start():
                 PIPELINE["mic_error"] = self.mic.error
+                PIPELINE["mic_active"] = False
                 await self.conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风不可用：{self.mic.error}", "degrade_hint": "check_device"})
                 self.mic = None
+            else:
+                PIPELINE["mic_active"] = True
         self.feeder_task = asyncio.create_task(self.feeder())
         self.ticker_task = asyncio.create_task(self.window_ticker())
 
@@ -288,6 +291,7 @@ class Router:
         if self.mic:
             self.mic.stop()
             self.mic = None
+            PIPELINE["mic_active"] = False
         while not self.audio_q.empty():
             try:
                 self.audio_q.get_nowait()
@@ -546,12 +550,15 @@ async def handler(ws):
             elif mtype == "mic.set":
                 if PIPELINE["mode"] == "real":
                     if p.get("muted") and router.mic:
-                        router.mic.stop(); router.mic = None
+                        router.mic.stop(); router.mic = None; PIPELINE["mic_active"] = False
                     elif not p.get("muted") and not router.mic:
                         router.mic = MicSource(router.loop, router.audio_q, device=resolve_mic_device())
                         if not router.mic.start():
+                            PIPELINE["mic_active"] = False
                             await conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风恢复失败：{router.mic.error}", "degrade_hint": "check_device"})
                             router.mic = None
+                        else:
+                            PIPELINE["mic_active"] = True
             elif mtype == "asr.context":
                 if p.get("hotwords"):
                     # 流式 paraformer 不吃热词（26 §8 决策点 3 挂起）；收下并如实记录
@@ -635,7 +642,29 @@ class HttpApi(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/healthz":
-            self._json(200, {"ok": True, "state": ENGINE_STATE["state"], "asr_mode": PIPELINE["mode"], "uptime_s": int(time.time() - START)})
+            self._json(200, {
+                "ok": True,
+                "state": ENGINE_STATE["state"],
+                "asr_mode": PIPELINE["mode"],
+                "uptime_s": int(time.time() - START),
+                "modules": {
+                    "mic": "ok" if PIPELINE["mic_active"] else (PIPELINE["mic_error"] or "off"),
+                    "kws": "on" if KWS["enabled"] else "off",
+                    "asr": PIPELINE["mode"],
+                    "tts": "on" if TTS["ready"] else "off",
+                    "barge_vad": "on" if BARGIN.get("vad") else "off",
+                },
+                "models": [
+                    {"kind": "asr", "name": "funasr-streaming-paraformer-zh-en",
+                     "status": "ok" if PIPELINE["mode"] == "real" else "fake"},
+                    {"kind": "kws", "name": "kws-zipformer-wenetspeech-3.3M",
+                     "status": "ok" if KWS["enabled"] else "off"},
+                    {"kind": "tts", "name": "kokoro-multi-lang-v1_0",
+                     "status": "ok" if TTS["ready"] else "fake"},
+                    {"kind": "vad", "name": "silero-vad",
+                     "status": "ok" if BARGIN.get("vad") else "off"},
+                ],
+            })
         elif self.path == "/metrics":
             lines = [f"voice_{k} {v}" for k, v in COUNTERS.items()] + [f'voice_state{{s="{ENGINE_STATE["state"]}"}} 1']
             body = ("\n".join(lines) + "\n").encode()

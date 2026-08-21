@@ -1,0 +1,40 @@
+{
+  "name": "hermit-status",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Hermit 各模块生效/监听状态的 host 层状态面板：/hermit/status 路由 + 侧边栏指示器（麦克风/模型/声音/摄像头）。host 层因为引擎是单例进程、且 client bundle 只能由 profile 层服务。",
+  "main": "lib/index.js",
+  "types": "lib/types/index.d.ts",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": {
+      "default": "./lib/client.js"
+    },
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "index.js",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  }
+}
