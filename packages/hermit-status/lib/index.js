@@ -153,4 +153,28 @@ export function apply(ctx, config) {
       res.end(body)
     },
   }), 'hermit-status:route')
+
+  // 实时电平路由（供侧边栏波形可视化，客户端高频轮询；代理引擎 8301 /level）
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: '/hermit/level',
+    handler: async (_req, res) => {
+      const probe = await probeEngine(healthzPort, '/level')
+      if (probe === null || probe.status !== 200) {
+        const body = JSON.stringify({ ok: false, levels: [], peak: 0, speaking: false, mic_active: false })
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+        res.end(body)
+        return
+      }
+      try {
+        const data = JSON.parse(probe.body)
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+        res.end(JSON.stringify(data))
+      } catch {
+        const body = JSON.stringify({ ok: false, levels: [], peak: 0, speaking: false, mic_active: false })
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
+        res.end(body)
+      }
+    },
+  }), 'hermit-status:level-route')
 }

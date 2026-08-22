@@ -78,6 +78,24 @@ BARGIN = {"vad": None}  # barge-in 静音检测 VAD（silero，D4）
 ASR_LOCK = asyncio.Lock()
 LAST_ASR = {"text": "", "at": 0.0}
 
+# 实时电平（供 /level 端点 + 侧边栏波形可视化）：feeder 写、HTTP 线程读
+LEVEL_LOCK = threading.Lock()
+LEVEL_HISTORY = []          # [(ts, rms)] 最近 ~3s，每 ~100ms 一个点
+LEVEL_PEAK = {"value": 0.0, "at": 0.0}
+
+
+def _push_level(rms: float):
+    """把 ~100ms 窗口的 RMS 追加到全局电平历史（线程安全，保留最近 3s）。"""
+    with LEVEL_LOCK:
+        now = time.time()
+        LEVEL_HISTORY.append((now, rms))
+        cutoff = now - 3.0
+        while LEVEL_HISTORY and LEVEL_HISTORY[0][0] < cutoff:
+            LEVEL_HISTORY.pop(0)
+        if rms > LEVEL_PEAK["value"]:
+            LEVEL_PEAK["value"] = rms
+            LEVEL_PEAK["at"] = now
+
 
 def now_ms():
     return int(time.time() * 1000)
@@ -266,7 +284,7 @@ class Router:
         if PIPELINE["mode"] != "real" or not PIPELINE["asr"]:
             return
         if CFG["mic"]["enabled"]:
-            self.mic = MicSource(self.loop, self.audio_q, device=resolve_mic_device())
+            self.mic = MicSource(self.loop, self.audio_q, device=resolve_mic_device(), gain=CFG["mic"].get("gain", 1.0))
             if not self.mic.start():
                 PIPELINE["mic_error"] = self.mic.error
                 PIPELINE["mic_active"] = False
@@ -364,7 +382,8 @@ class Router:
         now = time.time()
         in_window = now < self.conn.dialog_until
         frames = []
-        if not self._gate_enabled() or not self.conn.wake_armed or in_window or ENGINE_STATE["state"] == "listening":
+        gate = self._gate_enabled()
+        if not gate or not self.conn.wake_armed or in_window or ENGINE_STATE["state"] == "listening":
             # KWS 未启用 / 主人关闭唤醒(全开档) / 窗内 / 对话态：ASR 直通
             frames.extend(self._pipeline_event_frames(PIPELINE["asr"].feed(block)))
         else:
@@ -398,6 +417,8 @@ class Router:
 
     async def feeder(self):
         """麦克风帧 → 路由（speaking 期只喂 barge VAD；注入期间暂停消费，避免混音）。"""
+        hist_acc = 0.0
+        hist_n = 0
         while True:
             if self.injecting:
                 await asyncio.sleep(0.02)
@@ -406,6 +427,14 @@ class Router:
                 block = await asyncio.wait_for(self.audio_q.get(), timeout=0.2)
             except asyncio.TimeoutError:
                 continue
+            # 实时电平：每 ~100ms（3 个 32ms block）推一个点给 /level 波形可视化
+            f = block.astype(np.float32) / 32768.0
+            hist_acc += float(np.mean(f ** 2))
+            hist_n += 1
+            if hist_n >= 3:
+                _push_level((hist_acc / hist_n) ** 0.5)
+                hist_acc = 0.0
+                hist_n = 0
             if self.conn.speak_active and BARGIN["vad"]:
                 self._barge_feed(block)
                 continue
@@ -552,7 +581,7 @@ async def handler(ws):
                     if p.get("muted") and router.mic:
                         router.mic.stop(); router.mic = None; PIPELINE["mic_active"] = False
                     elif not p.get("muted") and not router.mic:
-                        router.mic = MicSource(router.loop, router.audio_q, device=resolve_mic_device())
+                        router.mic = MicSource(router.loop, router.audio_q, device=resolve_mic_device(), gain=CFG["mic"].get("gain", 1.0))
                         if not router.mic.start():
                             PIPELINE["mic_active"] = False
                             await conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风恢复失败：{router.mic.error}", "degrade_hint": "check_device"})
@@ -670,6 +699,12 @@ class HttpApi(BaseHTTPRequestHandler):
             body = ("\n".join(lines) + "\n").encode()
             self.send_response(200); self.send_header("Content-Type", "text/plain; version=0.0.1")
             self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        elif self.path == "/level":
+            with LEVEL_LOCK:
+                levels = [round(rms, 6) for _ts, rms in LEVEL_HISTORY]
+                peak = round(LEVEL_PEAK["value"], 6)
+                speaking = bool(levels) and levels[-1] >= 0.005
+            self._json(200, {"ok": True, "levels": levels, "peak": peak, "speaking": speaking, "mic_active": PIPELINE["mic_active"]})
         else:
             self._json(404, {"error": "not found"})
 

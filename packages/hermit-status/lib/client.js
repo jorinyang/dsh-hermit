@@ -40,6 +40,9 @@ window.__ModuleLoader__.load({
       '[' + ROW_ATTR + '] .h-badge{font-size:9px;padding:1px 4px;border-radius:3px;flex:none;line-height:1.4}',
       '[' + ROW_ATTR + '] .h-badge.local{background:#1e3a8a;color:#93c5fd}',
       '[' + ROW_ATTR + '] .h-badge.cloud{background:#7c2d12;color:#fdba74}',
+      '[' + ROW_ATTR + '] .h-wave-wrap{margin-bottom:6px}',
+      '[' + ROW_ATTR + '] .h-wave{display:block;width:100%;height:44px;border-radius:6px;background:rgba(128,128,128,.07);border:1px solid rgba(128,128,128,.28)}',
+      '[' + ROW_ATTR + '] .h-wave-label{font-size:10px;color:var(--dsw-alias-label-secondary,#9ca3af);display:flex;justify-content:space-between;margin-top:2px}',
     ].join('\n')
 
     function sidebarRoot() {
@@ -132,6 +135,39 @@ window.__ModuleLoader__.load({
       return w
     }
 
+    function drawWave(canvas, levels, speaking, labelEl) {
+      const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
+      const cssW = canvas.clientWidth || 200
+      const cssH = canvas.clientHeight || 44
+      const pw = Math.max(1, Math.round(cssW * dpr))
+      const ph = Math.max(1, Math.round(cssH * dpr))
+      if (canvas.width !== pw) canvas.width = pw
+      if (canvas.height !== ph) canvas.height = ph
+      const ctx = canvas.getContext('2d')
+      if (!ctx) return
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+      ctx.clearRect(0, 0, cssW, cssH)
+      const N = 30
+      const barW = cssW / N
+      const gap = Math.max(1, barW * 0.28)
+      const bw = Math.max(1.5, barW - gap)
+      const maxLevel = 0.15
+      const src = levels && levels.length ? levels.slice(-N) : []
+      for (let i = 0; i < N; i++) {
+        const val = src[i] ?? 0
+        const h = Math.max(1.5, Math.min(1, val / maxLevel) * (cssH - 6))
+        const x = i * barW + gap / 2
+        const y = cssH - 3 - h
+        ctx.fillStyle = val >= 0.005 ? '#22c55e' : 'rgba(128,128,128,.45)'
+        ctx.fillRect(x, y, bw, h)
+      }
+      if (labelEl) {
+        const live = levels && levels.length ? levels[levels.length - 1] : 0
+        labelEl.textContent = speaking || live >= 0.005 ? '● 收到声音' : '○ 未收到'
+        labelEl.style.color = (speaking || live >= 0.005) ? '#22c55e' : '#9ca3af'
+      }
+    }
+
     function render(container, data) {
       container.textContent = ''
       const engines = data && data.engines ? data.engines : []
@@ -179,6 +215,24 @@ window.__ModuleLoader__.load({
       box.setAttribute(ROW_ATTR, '')
       box.title = 'Hermit 各模块状态（3s 轮询）'
 
+      // 波形区（实时电平，高频轮询 /hermit/level，不被 status 渲染清空）
+      const waveWrap = document.createElement('div')
+      waveWrap.className = 'h-wave-wrap'
+      const waveLabel = document.createElement('div')
+      waveLabel.className = 'h-wave-label'
+      const waveL = document.createElement('span')
+      waveL.textContent = '声音接收'
+      const waveV = document.createElement('span')
+      waveV.textContent = '…'
+      waveLabel.append(waveL, waveV)
+      const canvas = document.createElement('canvas')
+      canvas.className = 'h-wave'
+      waveWrap.append(waveLabel, canvas)
+
+      // 状态区（render 只管这里）
+      const statusBody = document.createElement('div')
+      box.append(waveWrap, statusBody)
+
       let root
       let placed = false
       let alive = true
@@ -219,26 +273,46 @@ window.__ModuleLoader__.load({
         try {
           const r = await fetch('/hermit/status', { cache: 'no-store' })
           if (!alive) return
-          if (!r.ok) { if (!lastOk) render(box, {}); return }
+          if (!r.ok) { if (!lastOk) render(statusBody, {}); return }
           const ct = r.headers.get('content-type') || ''
-          if (!ct.includes('application/json')) { if (!lastOk) render(box, {}); return }
+          if (!ct.includes('application/json')) { if (!lastOk) render(statusBody, {}); return }
           const data = await r.json()
           if (!alive) return
           lastOk = true
-          render(box, data)
+          render(statusBody, data)
         } catch {
           if (!alive) return
-          if (!lastOk) render(box, {})
+          if (!lastOk) render(statusBody, {})
         }
       }
 
+      // 高频电平轮询（波形）
+      let levels = []
+      const pollLevel = async () => {
+        if (!alive) return
+        try {
+          const r = await fetch('/hermit/level', { cache: 'no-store' })
+          if (!alive) return
+          if (!r.ok) return
+          const ct = r.headers.get('content-type') || ''
+          if (!ct.includes('application/json')) return
+          const data = await r.json()
+          if (!alive) return
+          levels = (data && data.levels) || []
+          drawWave(canvas, levels, !!(data && data.speaking), waveV)
+        } catch { /* 电平路由不可达时保留旧波形 */ }
+      }
+
       poll()
+      pollLevel()
       const timer = setInterval(poll, 3000)
+      const levelTimer = setInterval(pollLevel, 160)
       tryPlace()
 
       return () => {
         alive = false
         clearInterval(timer)
+        clearInterval(levelTimer)
         waitObserver.disconnect()
         rootObserver.disconnect()
         box.remove()
