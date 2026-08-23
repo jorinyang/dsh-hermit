@@ -111,9 +111,16 @@ class MicSource:
         if status:
             pass  # input overflow 等瞬时状态忽略
         block = indata[:, 0].copy()
+        # 诊断：记录原始（增益前）电平 vs 增益后电平，判断 gain/tanh 是否失真（每 ~1s 一次）
+        self._cb_n = getattr(self, '_cb_n', 0) + 1
+        if self._cb_n % 32 == 1:
+            raw = block.astype(np.float32) / 32768.0
+            import sys
+            print(f"[voice-engine] MIC-RAW rms={float(np.mean(raw ** 2)) ** 0.5:.5f} peak={float(np.max(np.abs(raw))):.4f} gain={self.gain}", file=sys.stderr, flush=True)
         if self.gain != 1.0:
             f = block.astype(np.float32) * (self.gain / 32768.0)
-            np.clip(f, -1.0, 1.0, out=f)
+            # 软限幅（tanh）：高增益保证唤醒词命中，同时平滑压缩峰值、避免硬 clip 削波失真
+            np.tanh(f, out=f)
             block = (f * 32768.0).astype(np.int16)
         def _put():
             self.queue.put_nowait(block)

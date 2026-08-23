@@ -41,6 +41,25 @@ const REPO_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..
 // 口语句尾拖延词（12 §二 语义层，零 LLM）：命中则延长端点等待至 1200ms，避免抢切
 const SEMANTIC_EXTEND_RE = /(那个|这个|然后|就是|嗯|额|呃|啊|怎么说|我想想|等一下|等等|还有|或者说|然后呢|所以呢|就是那个)\s*$/
 
+// 诊断日志：console 在 agent-plane isolate realm 里可能被重定向/丢弃，直接落盘到文件最可靠
+const DEBUG_LOG = path.join(process.env.DSH_HOME ?? path.join(os.homedir(), '.dsh'), 'hermit-voice-debug.log')
+function debugLog(...args) {
+  try {
+    const line = `[${new Date().toISOString()}] ${args.map(a => (typeof a === 'object' ? JSON.stringify(a) : String(a))).join(' ')}\n`
+    fs.appendFileSync(DEBUG_LOG, line, 'utf8')
+  } catch { /* 诊断失败不致命 */ }
+}
+
+/** 从 assistant message 的 content 数组提取纯文本（跳过 tool-call/tool-result 等）。 */
+function extractText(content) {
+  if (!Array.isArray(content)) return ''
+  return content
+    .filter((b) => b && b.type === 'text' && typeof b.text === 'string')
+    .map((b) => b.text)
+    .join('')
+    .trim()
+}
+
 function loadOverlay() {
   try { return JSON.parse(fs.readFileSync(OVERLAY_FILE, 'utf8')) } catch { return {} }
 }
@@ -71,6 +90,7 @@ class VoiceService extends Service {
 
   constructor(ctx, config) {
     super(ctx, 'voice')
+    debugLog('[hermit-voice] VoiceService 构造，ctx.agents=', this.ctx.get('agents') ? '有' : '无')
     this.config = config
     this.overlay = loadOverlay()
     this.state = 'idle'
@@ -88,10 +108,19 @@ class VoiceService extends Service {
     this.pendingUtterance = null
     this.wakeArmed = true
     this.agent = null   // 本会话的 Agent（agent/created 作用域过滤事件捕获，用于转写注入）
+    this.lastAssistantText = ''  // 本轮最后一个助手回复文本（turn 结束时统一 TTS，避免流式多段互踩）
 
     if (typeof WebSocket !== 'function') {
       this.engineHealth = 'unsupported'
       this.ctx.logger?.warn?.('hermit-voice: 运行时无全局 WebSocket，语音桥不可用（降级 D3 纯文本）')
+      return
+    }
+    // 语音桥只在 4080（小寄专用 home）启用：多实例共享单例引擎+单麦克风会互相抢，导致唤醒/识别/发声错乱。
+    // 其他实例（53551 桌面 app 等）挂载 hermit-voice 时直接禁用语音桥，只保留纯文本降级。
+    this.voiceEnabled = String(process.env.DSH_HOME ?? '').includes('dsh-hermit')
+    if (!this.voiceEnabled) {
+      this.engineHealth = 'disabled'
+      debugLog('[hermit-voice] 非 4080 实例（DSH_HOME=' + (process.env.DSH_HOME || '默认') + '），语音桥禁用')
       return
     }
     this.ensureEngine()   // 幂等自启：端口探测已跑则不重复拉起
@@ -104,6 +133,22 @@ class VoiceService extends Service {
       this.connect()
       return () => this.teardown()
     }, 'hermit:voice-bridge')
+
+    // 「说」链路：监听本会话事件，turn 结束时取最后一个助手回复送 TTS（避免流式多段互踩 superseded）
+    this.ctx.effect(() => this.ctx.on('session/event', (session, event) => {
+      if (event?.type === 'assistant/message') {
+        const text = extractText(event?.data?.message?.content)
+        if (text) this.lastAssistantText = text
+        return
+      }
+      if (event?.type === 'turn/end') {
+        const text = this.lastAssistantText
+        this.lastAssistantText = ''
+        if (!text) return
+        debugLog('[hermit-voice] turn 结束 → TTS:', text.slice(0, 60))
+        this.speak({ text, source: 'conversation' })
+      }
+    }), 'hermit:tts-bridge')
   }
 
   /** 幂等拉起语音引擎（26 §C.4 auto_start 落地）。detached 子进程，随 dsh web 生命周期外独立存活。 */
@@ -143,14 +188,36 @@ class VoiceService extends Service {
     let ws
     try { ws = new WebSocket(this.engineUrl) } catch { this.scheduleReconnect(); return }
     this.ws = ws
+    let settled = false
+    // 握手失败时 onerror 会洪泛、onclose 可能不触发：用 settled 闸门确保只走一次断开清理并重连
+    const teardown = () => {
+      if (settled) return
+      settled = true
+      if (this.ws === ws) this.ws = null
+      this.onDisconnected()
+    }
     ws.onopen = () => {
+      settled = true
+      debugLog('[hermit-voice] WS 已连接引擎, home=', process.env.DSH_HOME ?? 'default')
       this.backoff = 1000
-      this.send('session.hello', { version: 1, caps: ['turn-machine', 'speak-priority'] })
+      this.send('session.hello', { version: 1, caps: ['turn-machine', 'speak-priority'], home: process.env.DSH_HOME ?? 'default' })
       this.startHeartbeat()
     }
-    ws.onmessage = (ev) => { try { this.handleFrame(JSON.parse(String(ev.data))) } catch {} }
-    ws.onclose = () => this.onDisconnected()
-    ws.onerror = () => { try { ws.close() } catch {} }
+    ws.onmessage = (ev) => {
+      try {
+        const f = JSON.parse(String(ev.data))
+        if (/^(asr|endpoint|wake|engine|tts|state)\./.test(f.type ?? '')) {
+          debugLog('[hermit-voice] 收到帧:', f.type, JSON.stringify(f.payload ?? {}).slice(0, 120))
+        }
+        this.handleFrame(f)
+      } catch {}
+    }
+    ws.onclose = () => teardown()
+    ws.onerror = (e) => {
+      if (settled) return
+      debugLog('[hermit-voice] WS error:', String(e?.message ?? e ?? ''))
+      teardown()
+    }
   }
 
   teardown() {
@@ -162,6 +229,7 @@ class VoiceService extends Service {
 
   onDisconnected() {
     const wasReady = this.ready
+    debugLog('onDisconnected 触发, wasReady=', wasReady, 'disposed=', !!this.ctx.runtime?.disposed)
     this.ws = null
     this.ready = false
     this.stopHeartbeat()
@@ -176,9 +244,13 @@ class VoiceService extends Service {
   }
 
   scheduleReconnect() {
-    if (this.reconnectTimer || this.ctx.runtime?.disposed) return
+    if (this.reconnectTimer || this.ctx.runtime?.disposed) {
+      debugLog('scheduleReconnect 跳过, timer=', !!this.reconnectTimer, 'disposed=', !!this.ctx.runtime?.disposed)
+      return
+    }
     const delay = this.backoff
     this.backoff = Math.min(this.backoff * 2, 30000)
+    debugLog('scheduleReconnect 安排重连, delay=', delay)
     this.reconnectTimer = setTimeout(() => { this.reconnectTimer = null; this.connect() }, delay)
   }
 
@@ -203,8 +275,9 @@ class VoiceService extends Service {
         this.engineHealth = 'ok'
         this.degrade = 0
         this.modules = { mic: p.mic ?? 'off', kws: p.kws ?? 'off', tts: p.tts ?? 'off', barge_vad: p.barge_vad ?? 'off', asr_mode: p.asr_mode ?? 'fake', models: p.models ?? [] }
-        // 重新协商：恢复唤醒态 + 端点阈值（overlay 持久化的用户偏好）+ 启用语义端点旁路
-        this.send('wake.set', { armed: this.wakeArmed })
+        // 重新协商：端点阈值（overlay 持久化的用户偏好）+ 启用语义端点旁路
+        // 注：唤醒模式(wake_mode) 已由引擎 TOGGLES 持有，重连时 Conn 会继承，
+        // 不再在此推送 wake.set，避免覆盖面板 hotkey/off 状态。
         this.send('endpoint.set', { acoustic_ms: this.overlay.acoustic_ms ?? 600, semantic_mode: true, semantic_wait_ms: 1200 })
         this.emitEngineStatus('ok')
         this.ctx.logger?.info?.('hermit-voice: 引擎就绪', JSON.stringify(p.models ?? []))
@@ -231,6 +304,7 @@ class VoiceService extends Service {
         this.ctx.emit('voice/transcript.partial', { text: p.text, ts: f.ts })
         break
       case 'asr.final':
+        debugLog('[hermit-voice] 收到 asr.final:', String(p.text ?? ''))
         this.setState('processing', 'asr-final')
         this.ctx.emit('voice/transcript.final', {
           text: p.text, confidence: p.confidence, emotion: p.emotion,
@@ -324,18 +398,26 @@ class VoiceService extends Service {
   injectTranscript(text) {
     const t = String(text ?? '').trim()
     if (!t) return
+    debugLog('[hermit-voice] injectTranscript 收到:', t, '| this.agent=', this.agent ? String(this.agent.id) : 'null')
     // 兜底：agent/created 事件若因 isolate realm 未送达，用 agents 服务找本会话 agent
     if (!this.agent) {
       const agents = this.ctx.get('agents')
+      debugLog('[hermit-voice] ctx.get(agents)=', agents ? '有' : '无')
       if (agents) {
-        const candidate = agents.currentInitiator() || agents.roots()[0] || agents.list()[0]
+        const init = typeof agents.currentInitiator === 'function' ? agents.currentInitiator() : undefined
+        const roots = typeof agents.roots === 'function' ? agents.roots() : []
+        const list = typeof agents.list === 'function' ? agents.list() : []
+        debugLog('[hermit-voice] currentInitiator=', init ? String(init.id) : 'null', '| roots=', roots.length, '| list=', list.length)
+        const candidate = init || roots[0] || list[0]
         if (candidate) this.agent = candidate
       }
     }
     if (!this.agent) {
+      debugLog('[hermit-voice] 未捕获 agent，注入失败')
       this.ctx.logger?.warn?.('hermit-voice: 未捕获 agent，转写未注入', t)
       return
     }
+    debugLog('[hermit-voice] 注入目标 agent=', String(this.agent.id), 'status=', this.agent.status)
     const message = createUserMessage({
       content: [{ type: 'text', text: t }],
       source: { kind: 'plugin', plugin: 'hermit-voice' },
@@ -343,8 +425,10 @@ class VoiceService extends Service {
     try {
       if (this.agent.status === 'idle') this.agent.followup(message)
       else this.agent.steer(message)
+      debugLog('[hermit-voice] 注入调用完成')
       this.ctx.logger?.info?.('hermit-voice: 转写注入', t)
     } catch (e) {
+      debugLog('[hermit-voice] 注入异常:', e?.message ?? String(e))
       this.ctx.logger?.warn?.('hermit-voice: 转写注入失败', e?.message ?? String(e))
     }
   }
@@ -479,4 +563,8 @@ export function apply(ctx, config) {
       },
     }), 'hermit:status-route')
   }
+
+  // 注：voiceBridge 曾用 ctx.provide 发布为 process-global 服务（让父 realm 的 hermit-core Arbiter 跨 realm 触发发声），
+  // 触发 DSH 挂载审计拒绝（preset 服务须 isolate 或移 host）。改为不发布——Arbiter 的 getBridge 缺席时已按软依赖自动降级纯文本，
+  // M1-B 语音汇报时机仲裁后续需把桥移到 host composition 再恢复。
 }

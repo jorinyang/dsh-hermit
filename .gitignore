@@ -14,5 +14,26 @@ runtime/voice/.venv/
 __pycache__/
 *.pyc
 
+# 语音调试残留（探测/临时产物不入库）
+runtime/voice/_*
+
 # 注：当前插件为 plain JS 直接写在 lib/（无构建环节），lib/ 即源码必须入库；
 # 未来迁移 TS 构建后改为忽略 lib/、跟踪 src/。
+
+
+# runtime 依赖/构建产物不入库（MVP-1 语音通道）
+runtime/mamba/
+runtime/micromamba/
+runtime/qwentts.cpp/
+runtime/cmake-*
+runtime/llama.cpp-*/
+runtime/voice/.venv/
+runtime/voice/*.wav
+runtime/voice/samples/
+runtime/voice/qwen_test*
+runtime/voice/_*
+runtime/*.cmd
+runtime/bench-*.ps1
+runtime/test-*.ps1
+__pycache__/
+*.pyc

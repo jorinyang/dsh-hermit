@@ -12,6 +12,9 @@ import { defineTool } from '@deepseek-ai/dsh-tools'
 import { budgetApi, spentOn, monthKey, MONTHLY } from './budget.js'
 import { confirmHighRisk, getCachedConfirmRef, cacheConfirmRef } from './permission.js'
 import { record as m1 } from './memory.js'
+import { toSpeechText } from './voice.js'
+import { createArbiter } from './arbiter.js'
+import { createProactiveScheduler } from './proactive.js'
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -77,6 +80,24 @@ function resolveHint(h) {
 export function apply(ctx) {
   const tasks = prune(loadTasks())
   const budget = budgetApi()
+
+  // M1-B Arbiter（03 §3.3 + 07 §六 + 26 §A.4）：汇报时机仲裁，消费 voiceBridge speak 出口。
+  // 软依赖：voiceBridge 缺席（语音引擎不在/未挂载）→ 全部 no-op，纯文本降级（26 §五 D3）。
+  const arbiter = createArbiter({
+    getBridge: () => ctx.get('voiceBridge'),
+    on: (name, cb) => ctx.on(name, cb),
+  })
+  ctx.effect(() => () => arbiter.dispose(), 'hermit:arbiter')
+  // 注：arbiter 曾用 ctx.provide 发布为 process-global 服务，触发 DSH 挂载审计（preset 服务须 isolate 或移 host）。
+  // 它只被本插件内部（proactive + task 回报）消费，改为纯局部变量即可，无需跨 realm。
+
+  // 07 主动发起调度器（MVP-1 第二波：调度器+守卫链+MVP活动感知+P1关怀+反馈闭环+user_directives）
+  const proactive = createProactiveScheduler({
+    getArbiter: () => arbiter,
+    on: (name, cb) => ctx.on(name, cb),
+  })
+  ctx.effect(() => () => proactive.dispose(), 'hermit:proactive')
+  // 注：proactive 曾用 ctx.provide 发布为 process-global 服务，同样触发挂载审计；改为局部变量。
 
   const dispatch = defineTool({
     name: 'dispatch_task',
@@ -213,7 +234,26 @@ export function apply(ctx) {
     },
   })
 
-  // 完成态追踪：状态机推进 + 预算实结 + M1 落库
+  const rememberDirective = defineTool({
+    name: 'remember_directive',
+    description: '记住主人的一个长期偏好（例如「别在晚上推送新闻」「以后都用 XX 模型」），永久生效并渲染进系统提示。主人明确说「以后…/别…/永远…」这类长期偏好时用。',
+    parameters: {
+      key: { type: 'string', required: true, description: '偏好主题（如「推送时段」「模型偏好」）' },
+      value: { type: 'string', required: true, description: '偏好内容（如「晚上23点后不推送」）' },
+    },
+    output: {
+      schema: { type: 'object', additionalProperties: false, properties: { summary: { type: 'string' } } },
+      render: (args, value) => [{ type: 'text', text: value.summary }],
+    },
+    async execute(args) {
+      const svc = proactive
+      if (!svc || typeof svc.setDirective !== 'function') return { summary: '记忆服务这会儿不在，先记不成。' }
+      svc.setDirective(String(args.key), String(args.value))
+      return { summary: `记住了：${args.key}＝${args.value}。以后都照这个来。` }
+    },
+  })
+
+  // 完成态追踪：状态机推进 + 预算实结 + M1 落库 + M1-B 语音汇报
   ctx.effect(() => ctx.on('subagent/end', (info) => {
     const childId = String((info && info.id) ?? '')
     if (!childId) return
@@ -223,9 +263,17 @@ export function apply(ctx) {
         t.status = /complete|success|done/i.test(sr) ? 'completed' : (/cancel/i.test(sr) ? 'cancelled' : 'failed')
         t.stopReason = sr; t.endedAt = Date.now()
         const s = budget.settle(key, t.hold)
-        m1(t.status === 'completed' ? 'task_completed' : 'task_failed', t.taskId,
-          `「${t.label}」${t.status}${s.ok ? ` 实结${s.actual}c` : ''}${sr ? `(${sr})` : ''}`)
+        const completedBrief = toSpeechText(`「${t.label}」${t.status}${s.ok ? ` 实结${s.actual}c` : ''}${sr ? `(${sr})` : ''}`)
+        m1(t.status === 'completed' ? 'task_completed' : 'task_failed', t.taskId, completedBrief)
         saveTasks(tasks)
+        // M1-B 语音汇报（26 §A.4 / 12 汇报注入）：成功=normal（语义间隙自然带出），失败=urgent（需主人决策，03 §3.3）
+                // M1-B 语音汇报占位（26 §A.4 / 12 汇报注入）：成功=normal（语义间隙自然带出），失败=urgent（需主人决策，03 §3.3）
+        // MVP-0 阶段：仅把任务摘要落 M1 + toSpeechText 处理；完整语义间隙仲裁在 M1-B voice 插件落地
+        if (t.status === 'completed') m1('voice_report_normal', t.taskId, '任务完成：' + completedBrief); else m1('voice_report_urgent', t.taskId, '任务失败：' + completedBrief);
+        const voiceText = t.status === 'completed'
+          ? `主人，「${t.label}」办好了。`
+          : (t.status === 'cancelled' ? `「${t.label}」取消了。` : `主人，「${t.label}」办砸了——我看看怎么办。`)
+        arbiter.submit({ text: voiceText, priority: t.status === 'completed' ? 'normal' : 'urgent', source: 'task' })
       }
     }
   }), 'hermit:subagent-end')
@@ -234,7 +282,8 @@ export function apply(ctx) {
     const d1 = ctx.tools.register(dispatch)
     const d2 = ctx.tools.register(status)
     const d3 = ctx.tools.register(budgetStatus)
-    return () => { d1(); d2(); d3() }
+    const d4 = ctx.tools.register(rememberDirective)
+    return () => { d1(); d2(); d3(); d4() }
   }, 'hermit:core-tools')
 }
 
@@ -275,5 +324,8 @@ function buildBrief(args, route, confirmRef) {
     '  3. 建议下一步（给主人的一句可选动作）',
     '没回报前不许结束。小寄会把你的汇报连同结果摘要一起转告主人。',
   )
-  return lines.join('\n')
+  const text = lines.join('\n')
+  // 语音路径预备（MVP-1 voice 通道）：对要朗读的文本做动作→拟声词替换（仅语音/拟声，UI 显示保留动作描写）
+  // 这里对完整 brief 过一遍是稳妥起见；M1-A 会把这条过滤下沉到 hermit-voice 插件
+  return toSpeechText(text)
 }

@@ -1,17 +1,12 @@
 /**
- * hermit-status 客户端半边：侧边栏「🦀 Hermit 状态」多栏卡片指示器。
+ * hermit-status 客户端半边：左栏「小寄状态面板」（4080 专用工作台的左侧）。
  *
- * 形态：hand-built client bundle —— 直接写成 window.__ModuleLoader__.load 协议
- * （对齐 dsh-ssh/lib/client.js 的产物格式），无需 tsdown 构建。
+ * 注册到官方 `sidebar.workspaces` 单槽，替换掉 WorkspaceBrowser（会话列表），
+ * 渲染完整状态面板：活动状态（思考/说话）+ 麦克风波形 + 引擎/模型卡片。
+ * 单一延续会话场景下不需要会话列表，小寄自己决定上下文隔离。
  *
- * 策略：
- *  - 纯 DOM 注入（不用 React、不用 slots）：dsh 侧边栏 shell 没有可供外部插件注册
- *    到「brand 行与 workspace 之间」的 slot，故沿用 dsh-ssh 的 DOM 注入 + MutationObserver
- *    自愈手法，把面板插到 SSH 入口（[data-dsh-ssh-entry]）之后、workspace 浏览器之前。
- *  - 布局：引擎与模型分组、各用 2 栏网格；每张卡片 = 指示灯（绿=在线/黄=有问题/红=不在线）
- *    + 名称 + 明细，模型卡另带「本地/云端」徽标。
- *  - 每 3s 轮询同源 /hermit/status（host 半边注册）。
- *  - 所有副作用（DOM、style、observer、timer）经 ctx.effect 注册 disposer（TSECS A2 可逆）。
+ * 形态：hand-built client bundle（window.__ModuleLoader__.load 协议，无需 tsdown）。
+ * 用 require('react') 取 React（模块表 externalize），React.createElement 构建（无 JSX）。
  *
  * @module hermit-status/client
  */
@@ -22,109 +17,56 @@ window.__ModuleLoader__.load({
     var exports = module.exports
     Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' })
 
-    const inject = []
-    const ROW_ATTR = 'data-hermit-status'
-    const STYLE_ID = 'hermit-status-style'
-    const COLOR = { ok: '#22c55e', warn: '#f59e0b', down: '#ef4444', unknown: '#6b7280' }
+    const React = require('react')
+    const inject = ['slots', 'betterSidebar']
+    const COLOR = { ok: '#22c55e', warn: '#f59e0b', down: '#ef4444', unknown: '#6b7280', off: '#9ca3af' }
+    const STATE_LABEL = { idle: '待机', listening: '聆听中', processing: '思考中', speaking: '说话中' }
 
     const CSS = [
-      '[' + ROW_ATTR + ']{padding:8px 10px;font-size:12px;user-select:none;border-top:1px solid rgba(128,128,128,.25);line-height:1.3}',
-      '[' + ROW_ATTR + '] .h-head{display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:2px;color:var(--dsw-alias-label-primary,#e5e7eb)}',
-      '[' + ROW_ATTR + '] .h-sec{font-size:10px;color:var(--dsw-alias-label-secondary,#9ca3af);margin:8px 0 4px;letter-spacing:.5px}',
-      '[' + ROW_ATTR + '] .h-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}',
-      '[' + ROW_ATTR + '] .h-card{border:1px solid rgba(128,128,128,.28);border-radius:6px;padding:5px 6px;background:rgba(128,128,128,.07);min-width:0}',
-      '[' + ROW_ATTR + '] .h-card .c1{display:flex;align-items:center;gap:5px;min-width:0}',
-      '[' + ROW_ATTR + '] .h-dot{width:7px;height:7px;border-radius:50%;flex:none;box-shadow:0 0 4px currentColor}',
-      '[' + ROW_ATTR + '] .h-name{font-weight:500;color:var(--dsw-alias-label-primary,#e5e7eb);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}',
-      '[' + ROW_ATTR + '] .h-sub{font-size:10px;color:var(--dsw-alias-label-secondary,#9ca3af);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}',
-      '[' + ROW_ATTR + '] .h-badge{font-size:9px;padding:1px 4px;border-radius:3px;flex:none;line-height:1.4}',
-      '[' + ROW_ATTR + '] .h-badge.local{background:#1e3a8a;color:#93c5fd}',
-      '[' + ROW_ATTR + '] .h-badge.cloud{background:#7c2d12;color:#fdba74}',
-      '[' + ROW_ATTR + '] .h-wave-wrap{margin-bottom:6px}',
-      '[' + ROW_ATTR + '] .h-wave{display:block;width:100%;height:44px;border-radius:6px;background:rgba(128,128,128,.07);border:1px solid rgba(128,128,128,.28)}',
-      '[' + ROW_ATTR + '] .h-wave-label{font-size:10px;color:var(--dsw-alias-label-secondary,#9ca3af);display:flex;justify-content:space-between;margin-top:2px}',
+      '.hermit-panel{padding:10px 12px;font-size:12px;line-height:1.35;user-select:none;overflow-y:auto;height:100%;box-sizing:border-box}',
+      '.hermit-panel .hp-head{display:flex;align-items:center;gap:6px;font-weight:600;margin-bottom:8px;color:var(--dsw-alias-label-primary,#e5e7eb)}',
+      '.hermit-panel .hp-activity{display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px}',
+      '.hermit-panel .hp-act{border:1px solid rgba(128,128,128,.28);border-radius:8px;padding:8px 10px;background:rgba(128,128,128,.07);display:flex;align-items:center;gap:8px}',
+      '.hermit-panel .hp-act .ico{font-size:16px;line-height:1}',
+      '.hermit-panel .hp-act .lbl{font-size:11px;color:var(--dsw-alias-label-secondary,#9ca3af)}',
+      '.hermit-panel .hp-act .val{font-weight:600;color:var(--dsw-alias-label-primary,#e5e7eb)}',
+      '.hermit-panel .hp-wave-wrap{margin-bottom:8px}',
+      '.hermit-panel .hp-wave{display:block;width:100%;height:46px;border-radius:6px;background:rgba(128,128,128,.07);border:1px solid rgba(128,128,128,.28)}',
+      '.hermit-panel .hp-wave-label{font-size:10px;color:var(--dsw-alias-label-secondary,#9ca3af);display:flex;justify-content:space-between;margin-top:2px}',
+      '.hermit-panel .hp-sec{font-size:10px;color:var(--dsw-alias-label-secondary,#9ca3af);margin:10px 0 4px;letter-spacing:.5px}',
+      '.hermit-panel .hp-grid{display:grid;grid-template-columns:1fr 1fr;gap:5px}',
+      '.hermit-panel .hp-card{border:1px solid rgba(128,128,128,.28);border-radius:6px;padding:5px 6px;background:rgba(128,128,128,.07);min-width:0}',
+      '.hermit-panel .hp-card.clickable{cursor:pointer}',
+      '.hermit-panel .hp-card.off{opacity:.5;border-style:dashed}',
+      '.hermit-panel .hp-card .c1{display:flex;align-items:center;gap:5px;min-width:0}',
+      '.hermit-panel .hp-dot{width:7px;height:7px;border-radius:50%;flex:none;box-shadow:0 0 4px currentColor}',
+      '.hermit-panel .hp-name{font-weight:500;color:var(--dsw-alias-label-primary,#e5e7eb);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}',
+      '.hermit-panel .hp-sub{font-size:10px;color:var(--dsw-alias-label-secondary,#9ca3af);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:1px}',
+      '.hermit-panel .hp-badge{font-size:9px;padding:1px 4px;border-radius:3px;flex:none;line-height:1.4}',
+      '.hermit-panel .hp-badge.local{background:#1e3a8a;color:#93c5fd}',
+      '.hermit-panel .hp-badge.cloud{background:#7c2d12;color:#fdba74}',
+      '.hermit-res{font-size:12px;line-height:1.4;padding:2px 2px 12px;height:100%;overflow-y:auto;box-sizing:border-box}',
+      '.hermit-res .hr-sec{font-size:11px;font-weight:600;color:var(--dsw-alias-label-primary,#e5e7eb);margin:12px 0 6px;display:flex;align-items:center;gap:6px}',
+      '.hermit-res .hr-cnt{font-size:10px;color:var(--dsw-alias-label-secondary,#9ca3af);font-weight:400}',
+      '.hermit-res .hr-item{border:1px solid rgba(128,128,128,.25);border-radius:6px;padding:6px 8px;margin-bottom:5px;background:rgba(128,128,128,.06)}',
+      '.hermit-res .hr-row{display:flex;align-items:center;gap:6px;min-width:0}',
+      '.hermit-res .hr-name{font-weight:500;color:var(--dsw-alias-label-primary,#e5e7eb);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}',
+      '.hermit-res .hr-tag{font-size:9px;padding:1px 4px;border-radius:3px;flex:none}',
+      '.hermit-res .hr-tag.on{background:#14532d;color:#4ade80}',
+      '.hermit-res .hr-tag.off{background:#7f1d1d;color:#fca5a5}',
+      '.hermit-res .hr-desc{font-size:11px;color:var(--dsw-alias-label-secondary,#9ca3af);margin-top:3px;word-break:break-all}',
+      '.hermit-res .hr-toggle{margin-left:auto;flex:none}',
+      '.hermit-panel .hp-switch{width:30px;height:16px;border-radius:8px;background:rgba(128,128,128,.35);position:relative;cursor:pointer;flex:none;transition:background .15s}',
+      '.hermit-panel .hp-switch.on{background:#22c55e}',
+      '.hermit-panel .hp-switch .knob{position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:50%;background:#fff;transition:left .15s}',
+      '.hermit-panel .hp-switch.on .knob{left:16px}',
+      // 补丁：better-sidebar 底部面板推挤选择器 [data-dsh-frame]>[data-pane="conversation"] 在 DSH 0.1.0-rc.8 不存在。
+      // 中央列是 CSS module 哈希类名（各构建不同），但 conversation 槽宿主有稳定的 data-slot="conversation"，
+      // 用 :has() 反向选中它的父级（即中央列），margin-bottom 顶起聊天/输入框。
+      '#root :has(> [data-slot="conversation"]){margin-bottom:var(--dsh-sidebar-height,0px);transition:margin-bottom .2s ease}',
     ].join('\n')
 
-    function sidebarRoot() {
-      if (typeof document === 'undefined') return undefined
-      const column = document.querySelector('[data-pane="sidebar"], [class*="sidebarCol"]')
-      if (column === null) return undefined
-      const logoOwner = column.querySelector('[class*="logoRow"]')?.parentElement
-      return logoOwner ?? (column.firstElementChild || undefined)
-    }
-
-    function anchorElement(root) {
-      const ssh = root.querySelector('[data-dsh-ssh-entry]')
-      if (ssh !== null) return ssh
-      const newSession = root.querySelector('button[class*="newSession"]')
-      if (newSession !== null) {
-        const row = newSession.closest('[class*="logoRow"]')
-        return (row !== null && row.parentElement === root) ? row : newSession
-      }
-      return null
-    }
-
-    function inPlace(root, box, anchor) {
-      if (box.parentElement !== root) return false
-      if (anchor === null) return box === root.firstElementChild
-      return box.previousElementSibling === anchor
-    }
-
-    function place(root, box, anchor) {
-      if (anchor === null) root.insertBefore(box, root.firstElementChild)
-      else root.insertBefore(box, anchor.nextElementSibling)
-    }
-
     function colorOf(status) { return COLOR[status] ?? COLOR.unknown }
-
-    function dot(status) {
-      const d = document.createElement('span')
-      d.className = 'h-dot'
-      const c = colorOf(status)
-      d.style.background = c
-      d.style.color = c
-      return d
-    }
-
-    function card(status, name, sub, badge) {
-      const el = document.createElement('div')
-      el.className = 'h-card'
-      const c1 = document.createElement('div')
-      c1.className = 'c1'
-      c1.append(dot(status))
-      const nm = document.createElement('span')
-      nm.className = 'h-name'
-      nm.textContent = name
-      c1.append(nm)
-      if (badge) {
-        const b = document.createElement('span')
-        b.className = 'h-badge ' + badge
-        b.textContent = badge === 'local' ? '本地' : '云端'
-        c1.append(b)
-      }
-      el.append(c1)
-      if (sub) {
-        const s = document.createElement('div')
-        s.className = 'h-sub'
-        s.textContent = sub
-        el.append(s)
-      }
-      return el
-    }
-
-    function section(label) {
-      const s = document.createElement('div')
-      s.className = 'h-sec'
-      s.textContent = label
-      return s
-    }
-
-    function grid(items) {
-      const g = document.createElement('div')
-      g.className = 'h-grid'
-      for (const it of items) g.append(it)
-      return g
-    }
 
     function worst(list) {
       let w = 'ok'
@@ -135,10 +77,11 @@ window.__ModuleLoader__.load({
       return w
     }
 
-    function drawWave(canvas, levels, speaking, labelEl) {
+    function drawWave(canvas, levels, speaking) {
+      if (!canvas) return
       const dpr = (typeof window !== 'undefined' && window.devicePixelRatio) || 1
       const cssW = canvas.clientWidth || 200
-      const cssH = canvas.clientHeight || 44
+      const cssH = canvas.clientHeight || 46
       const pw = Math.max(1, Math.round(cssW * dpr))
       const ph = Math.max(1, Math.round(cssH * dpr))
       if (canvas.width !== pw) canvas.width = pw
@@ -161,167 +104,329 @@ window.__ModuleLoader__.load({
         ctx.fillStyle = val >= 0.005 ? '#22c55e' : 'rgba(128,128,128,.45)'
         ctx.fillRect(x, y, bw, h)
       }
-      if (labelEl) {
-        const live = levels && levels.length ? levels[levels.length - 1] : 0
-        labelEl.textContent = speaking || live >= 0.005 ? '● 收到声音' : '○ 未收到'
-        labelEl.style.color = (speaking || live >= 0.005) ? '#22c55e' : '#9ca3af'
-      }
     }
 
-    function render(container, data) {
-      container.textContent = ''
-      const engines = data && data.engines ? data.engines : []
-      const models = data && data.models ? data.models : []
-      const engineHealth = data && data.engine ? data.engine.health : 'down'
-
-      const overall = engineHealth === 'down'
-        ? 'down'
-        : worst(engines.concat(models))
-
-      const head = document.createElement('div')
-      head.className = 'h-head'
-      head.append(dot(overall))
-      const title = document.createElement('span')
-      title.textContent = '🦀 Hermit 状态'
-      head.append(title)
-      container.append(head)
-
-      // 引擎组
-      container.append(section('引擎'))
-      const engineCards = engines.map((e) => card(e.status, e.label, e.detail ?? null, null))
-      container.append(grid(engineCards))
-
-      // 模型组
-      container.append(section('模型'))
-      const modelCards = models.map((m) => card(m.status, m.label, m.name ?? null, m.loc === 'local' ? 'local' : 'cloud'))
-      container.append(grid(modelCards))
+    function Dot(props) {
+      const c = colorOf(props.status)
+      return React.createElement('span', { className: 'hp-dot', style: { background: c, color: c } })
     }
 
-    function mountStatusIndicator() {
-      if (typeof document === 'undefined') return () => {}
-      if (document.querySelector('[' + ROW_ATTR + ']') !== null) return () => {}
+    function Card(props) {
+      const toggleable = !!props.toggleable
+      const off = toggleable && !props.on
+      const cls = 'hp-card' + (toggleable ? ' clickable' : '') + (off ? ' off' : '')
+      const onClick = toggleable ? () => { if (props.onToggle) props.onToggle(!props.on) } : undefined
+      return React.createElement('div', { className: cls, onClick },
+        React.createElement('div', { className: 'c1' },
+          React.createElement(Dot, { status: props.status }),
+          React.createElement('span', { className: 'hp-name' }, props.label),
+          props.badge
+            ? React.createElement('span', { className: 'hp-badge ' + props.badge }, props.badge === 'local' ? '本地' : '云端')
+            : null,
+        ),
+        props.sub ? React.createElement('div', { className: 'hp-sub' }, props.sub) : null,
+      )
+    }
 
-      // 注入一次样式（幂等 + 随 disposer 回收）
-      let styleEl = document.getElementById(STYLE_ID)
-      const styleOwned = styleEl === null
-      if (styleEl === null) {
-        styleEl = document.createElement('style')
-        styleEl.id = STYLE_ID
-        styleEl.textContent = CSS
-        document.head.append(styleEl)
-      }
+    function Activity(props) {
+      // 思考 / 说话 状态灯
+      const thinkOn = !!(props.agent && props.agent.thinking)
+      const speakOn = !!(props.agent && props.agent.speaking)
+      return React.createElement('div', { className: 'hp-activity' },
+        React.createElement('div', { className: 'hp-act', style: thinkOn ? { borderColor: '#22c55e', background: 'rgba(34,197,94,.08)' } : {} },
+          React.createElement('span', { className: 'ico' }, '💭'),
+          React.createElement('div', null,
+            React.createElement('div', { className: 'lbl' }, '思考'),
+            React.createElement('div', { className: 'val', style: thinkOn ? { color: '#22c55e' } : {} }, thinkOn ? '思考中' : '待机'),
+          ),
+        ),
+        React.createElement('div', { className: 'hp-act', style: speakOn ? { borderColor: '#22c55e', background: 'rgba(34,197,94,.08)' } : {} },
+          React.createElement('span', { className: 'ico' }, '🔊'),
+          React.createElement('div', null,
+            React.createElement('div', { className: 'lbl' }, '输出'),
+            React.createElement('div', { className: 'val', style: speakOn ? { color: '#22c55e' } : {} }, speakOn ? '说话中' : '静默'),
+          ),
+        ),
+      )
+    }
 
-      const box = document.createElement('div')
-      box.setAttribute(ROW_ATTR, '')
-      box.title = 'Hermit 各模块状态（3s 轮询）'
+    function StatusPanel() {
+      const [status, setStatus] = React.useState(null)
+      const [level, setLevel] = React.useState({ levels: [], speaking: false })
+      const waveRef = React.useRef(null)
 
-      // 波形区（实时电平，高频轮询 /hermit/level，不被 status 渲染清空）
-      const waveWrap = document.createElement('div')
-      waveWrap.className = 'h-wave-wrap'
-      const waveLabel = document.createElement('div')
-      waveLabel.className = 'h-wave-label'
-      const waveL = document.createElement('span')
-      waveL.textContent = '声音接收'
-      const waveV = document.createElement('span')
-      waveV.textContent = '…'
-      waveLabel.append(waveL, waveV)
-      const canvas = document.createElement('canvas')
-      canvas.className = 'h-wave'
-      waveWrap.append(waveLabel, canvas)
-
-      // 状态区（render 只管这里）
-      const statusBody = document.createElement('div')
-      box.append(waveWrap, statusBody)
-
-      let root
-      let placed = false
-      let alive = true
-      let lastOk = false
-
-      const tryPlace = () => {
-        if (root !== undefined && !root.isConnected) {
-          rootObserver.disconnect()
-          root = undefined
-          placed = false
-        }
-        if (placed) {
-          if (!document.body.contains(box)) {
-            rootObserver.disconnect()
-            root = undefined
-            placed = false
-          } else if (root !== undefined && !inPlace(root, box, anchorElement(root))) {
-            place(root, box, anchorElement(root))
-            return
-          } else {
-            return
-          }
-        }
-        root = root ?? sidebarRoot()
-        if (root === undefined) return
-        place(root, box, anchorElement(root))
-        placed = true
-        rootObserver.observe(root, { childList: true, subtree: true })
-      }
-
-      const waitObserver = new MutationObserver(() => { tryPlace() })
-      waitObserver.observe(document.body, { childList: true, subtree: true })
-
-      const rootObserver = new MutationObserver(() => { tryPlace() })
-
-      const poll = async () => {
-        if (!alive) return
+      const refreshStatus = React.useCallback(async () => {
         try {
           const r = await fetch('/hermit/status', { cache: 'no-store' })
-          if (!alive) return
-          if (!r.ok) { if (!lastOk) render(statusBody, {}); return }
-          const ct = r.headers.get('content-type') || ''
-          if (!ct.includes('application/json')) { if (!lastOk) render(statusBody, {}); return }
-          const data = await r.json()
-          if (!alive) return
-          lastOk = true
-          render(statusBody, data)
-        } catch {
-          if (!alive) return
-          if (!lastOk) render(statusBody, {})
-        }
-      }
-
-      // 高频电平轮询（波形）
-      let levels = []
-      const pollLevel = async () => {
-        if (!alive) return
-        try {
-          const r = await fetch('/hermit/level', { cache: 'no-store' })
-          if (!alive) return
           if (!r.ok) return
           const ct = r.headers.get('content-type') || ''
           if (!ct.includes('application/json')) return
           const data = await r.json()
-          if (!alive) return
-          levels = (data && data.levels) || []
-          drawWave(canvas, levels, !!(data && data.speaking), waveV)
-        } catch { /* 电平路由不可达时保留旧波形 */ }
+          setStatus(data)
+        } catch { /* 路由不可达保留旧状态 */ }
+      }, [])
+
+      const refreshLevel = React.useCallback(async () => {
+        try {
+          const r = await fetch('/hermit/level', { cache: 'no-store' })
+          if (!r.ok) return
+          const ct = r.headers.get('content-type') || ''
+          if (!ct.includes('application/json')) return
+          const data = await r.json()
+          setLevel({ levels: (data && data.levels) || [], speaking: !!(data && data.speaking) })
+        } catch { /* 保留旧波形 */ }
+      }, [])
+
+      React.useEffect(() => {
+        refreshStatus()
+        refreshLevel()
+        const t1 = setInterval(refreshStatus, 3000)
+        const t2 = setInterval(refreshLevel, 160)
+        return () => { clearInterval(t1); clearInterval(t2) }
+      }, [refreshStatus, refreshLevel])
+
+      // 波形绘制
+      React.useEffect(() => { drawWave(waveRef.current, level.levels, level.speaking) }, [level])
+
+      const toggleEngine = async (module, on) => {
+        try {
+          await fetch('/hermit/engine', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ module, on }),
+          })
+        } catch { /* 引擎不可达 */ }
+        refreshStatus()
       }
 
-      poll()
-      pollLevel()
-      const timer = setInterval(poll, 3000)
-      const levelTimer = setInterval(pollLevel, 160)
-      tryPlace()
-
-      return () => {
-        alive = false
-        clearInterval(timer)
-        clearInterval(levelTimer)
-        waitObserver.disconnect()
-        rootObserver.disconnect()
-        box.remove()
-        if (styleOwned && styleEl) styleEl.remove()
+      const setWakeMode = async (mode) => {
+        try {
+          await fetch('/hermit/engine', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ module: 'wake', mode }),
+          })
+        } catch { /* 引擎不可达 */ }
+        refreshStatus()
       }
+
+      const engines = (status && status.engines) || []
+      const models = (status && status.models) || []
+      const engineHealth = (status && status.engine && status.engine.health) || 'down'
+      const overall = engineHealth === 'down' ? 'down' : worst(engines.concat(models))
+      const live = level.levels && level.levels.length ? level.levels[level.levels.length - 1] : 0
+      const micOn = level.speaking || live >= 0.005
+      const state = status && status.state ? (STATE_LABEL[status.state] || status.state) : null
+
+      return React.createElement('div', { className: 'hermit-panel' },
+        React.createElement('div', { className: 'hp-head' },
+          React.createElement(Dot, { status: overall }),
+          React.createElement('span', null, '🦀 小寄状态'),
+        ),
+
+        React.createElement(Activity, { agent: status && status.agent }),
+
+        React.createElement('div', { className: 'hp-wave-wrap' },
+          React.createElement('div', { className: 'hp-wave-label' },
+            React.createElement('span', null, '麦克风'),
+            React.createElement('span', { style: micOn ? { color: '#22c55e' } : {} }, micOn ? '● 收到声音' : '○ 未收到'),
+          ),
+          React.createElement('canvas', { className: 'hp-wave', ref: waveRef }),
+        ),
+
+        state
+          ? React.createElement('div', { className: 'hp-sub', style: { marginBottom: 2 } }, '语音状态：' + state)
+          : null,
+
+        React.createElement('div', { className: 'hp-sec' }, '引擎'),
+        React.createElement('div', { className: 'hp-grid' },
+          engines.map((e) => {
+            let on = e.on
+            let onToggle = null
+            if (e.toggleable) {
+              if (e.id === 'kws') {
+                // 唤醒三态：语音(绿)→按键(橙)→关闭(红) 循环；状态灯颜色区分，不用灰色 off 视觉
+                on = true
+                const order = ['voice', 'hotkey', 'off']
+                const cur = order.indexOf(e.mode) >= 0 ? e.mode : 'voice'
+                onToggle = () => setWakeMode(order[(order.indexOf(cur) + 1) % order.length])
+              } else {
+                onToggle = (v) => toggleEngine(e.id, v)
+              }
+            }
+            return React.createElement(Card, { key: e.id, status: e.status, label: e.label, sub: e.detail || null, toggleable: !!e.toggleable, on, onToggle })
+          }),
+        ),
+
+        React.createElement('div', { className: 'hp-sec' }, '模型'),
+        React.createElement('div', { className: 'hp-grid' },
+          models.map((m) => React.createElement(Card, { key: m.id, status: m.status, label: m.label, sub: m.name || null, badge: m.loc === 'local' ? 'local' : 'cloud' })),
+        ),
+      )
+    }
+
+    /** 拉取 /hermit/catalog（插件/技能/MCP/CLI 四类资源）的共享轮询。 */
+    function useCatalog() {
+      const [catalog, setCatalog] = React.useState(null)
+      React.useEffect(() => {
+        let alive = true
+        const poll = async () => {
+          try {
+            const r = await fetch('/hermit/catalog', { cache: 'no-store' })
+            if (!alive || !r.ok) return
+            const ct = r.headers.get('content-type') || ''
+            if (!ct.includes('application/json')) return
+            const data = await r.json()
+            if (alive) setCatalog(data)
+          } catch { /* 保留旧目录 */ }
+        }
+        poll()
+        const t = setInterval(poll, 8000)
+        return () => { alive = false; clearInterval(t) }
+      }, [])
+      return catalog
+    }
+
+    /** 可展开列表：items = [{key,name,tag,tagLabel,desc}] */
+    function ExpandList(props) {
+      const [open, setOpen] = React.useState({})
+      const toggle = (k) => setOpen((s) => ({ ...s, [k]: !s[k] }))
+      return React.createElement('div', { className: 'hermit-res' },
+        (props.items || []).map((it) => {
+          const expanded = !!open[it.key]
+          return React.createElement('div', { key: it.key, className: 'hr-item', onClick: () => toggle(it.key), style: { cursor: 'pointer' } },
+            React.createElement('div', { className: 'hr-row' },
+              it.tag ? React.createElement('span', { className: 'hr-tag ' + it.tag }, it.tagLabel ?? '') : null,
+              React.createElement('span', { className: 'hr-name', title: it.name }, it.name),
+              React.createElement('span', { className: 'hr-toggle' }, expanded ? '▾' : '▸'),
+            ),
+            expanded
+              ? React.createElement('div', null,
+                  it.desc ? React.createElement('div', { className: 'hr-desc' }, it.desc) : null,
+                )
+              : null,
+          )
+        }),
+      )
+    }
+
+    function PluginsTab() {
+      const catalog = useCatalog()
+      const plugins = (catalog && catalog.plugins) || []
+      const items = plugins.map((p) => ({ key: 'p:' + p.id, name: p.name, tag: p.enabled ? 'on' : 'off', tagLabel: p.enabled ? '启用' : '禁用' }))
+      return React.createElement(ExpandList, { items })
+    }
+
+    function SkillsTab() {
+      const catalog = useCatalog()
+      const skills = (catalog && catalog.skills) || []
+      const items = skills.map((s) => ({ key: 's:' + s.name, name: s.name, tag: 'on', tagLabel: '启用', desc: s.description || null }))
+      return React.createElement(ExpandList, { items })
+    }
+
+    function McpTab() {
+      const catalog = useCatalog()
+      const mcps = (catalog && catalog.mcps) || []
+      const items = mcps.map((m) => ({ key: 'm:' + m.name, name: m.name, tag: 'on', tagLabel: '已接', desc: m.tools && m.tools.length ? m.tools.length + ' 个工具：' + m.tools.join(', ') : null }))
+      return React.createElement(ExpandList, { items })
+    }
+
+    function CliTab() {
+      const catalog = useCatalog()
+      const clis = (catalog && catalog.clis) || []
+      const items = clis.map((c) => ({ key: 'c:' + c.name, name: c.name, tag: 'on', tagLabel: '已装', desc: c.path || null }))
+      return React.createElement(ExpandList, { items })
     }
 
     function apply(ctx) {
-      ctx.effect(() => mountStatusIndicator(), 'hermit-status:indicator')
+      ctx.effect(() => {
+        const style = document.createElement('style')
+        style.id = 'hermit-status-style'
+        style.textContent = CSS
+        document.head.append(style)
+        return () => style.remove()
+      }, 'hermit-status:style')
+
+      // JS 补丁：底部面板推挤——找到中央列（[data-slot="conversation"] 的父级），
+      // 让它的 margin-bottom 引用 better-sidebar 写在 <html> 上的 --dsh-sidebar-height，
+      // 底部面板打开时变量生效 → 聊天/输入框被顶上去（不覆盖）。轮询兜底 remount。
+      ctx.effect(() => {
+        const patch = () => {
+          const slot = document.querySelector('[data-slot="conversation"]')
+          const col = slot ? slot.parentElement : null
+          if (col && col.style.marginBottom !== 'var(--dsh-sidebar-height, 0px)') {
+            col.style.marginBottom = 'var(--dsh-sidebar-height, 0px)'
+            col.style.transition = 'margin-bottom .2s ease'
+          }
+        }
+        patch()
+        const t = setInterval(patch, 1500)
+        return () => clearInterval(t)
+      }, 'hermit-status:bottom-push')
+
+      // 右 Shift 唤醒快捷键：按下触发一次唤醒（PTT 式，打开聆听窗，随后说话即被识别）
+      ctx.effect(() => {
+        const onKey = (e) => {
+          if (e.code === 'ShiftRight' && !e.repeat) {
+            fetch('/hermit/wake', { method: 'POST' }).catch(() => {})
+          }
+        }
+        window.addEventListener('keydown', onKey)
+        return () => window.removeEventListener('keydown', onKey)
+      }, 'hermit-status:shift-wake')
+
+      // 单会话模型：启动/刷新后自动接回上次主会话（fetch /hermit/last-session → sessions.open）
+      ctx.effect(() => {
+        let cancelled = false
+        let attempts = 0
+        const resume = async () => {
+          if (cancelled) return
+          attempts += 1
+          let opened = false
+          try {
+            const r = await fetch('/hermit/last-session', { cache: 'no-store' })
+            if (!cancelled && r.ok) {
+              const ct = r.headers.get('content-type') || ''
+              if (ct.includes('application/json')) {
+                const data = await r.json()
+                const id = data && data.sessionId
+                if (id) {
+                  const sessions = ctx.get('sessions')
+                  if (sessions && typeof sessions.open === 'function') { sessions.open(id); opened = true }
+                }
+              }
+            }
+          } catch { /* 路由不可达则保持默认 */ }
+          // 会话持久化重建可能要等 client 的 session.list RPC 落地，重试几次直到打开成功
+          if (!opened && attempts < 6 && !cancelled) setTimeout(resume, 2000)
+        }
+        setTimeout(resume, 1500)
+        return () => { cancelled = true }
+      }, 'hermit-status:resume-session')
+
+      ctx.slots.inject('sidebar.workspaces', () => ctx.slots.register(
+        { name: 'sidebar.workspaces', priority: -1 },
+        StatusPanel,
+      ))
+
+      // 右侧底部面板的 4 个资源 tab：插件 / 技能 / MCP / CLI（注册进 better-sidebar，
+      // 拖到底部面板即可；布局按会话持久化，拖一次生效）
+      ctx.effect(() => ctx.betterSidebar.registerTab({
+        id: 'hermit:plugins', title: '插件', icon: '🧩', order: 61, single: true,
+        component: () => React.createElement(PluginsTab),
+      }), 'hermit-status:plugins-tab')
+      ctx.effect(() => ctx.betterSidebar.registerTab({
+        id: 'hermit:skills', title: '技能', icon: '🧰', order: 62, single: true,
+        component: () => React.createElement(SkillsTab),
+      }), 'hermit-status:skills-tab')
+      ctx.effect(() => ctx.betterSidebar.registerTab({
+        id: 'hermit:mcp', title: 'MCP', icon: '🔌', order: 63, single: true,
+        component: () => React.createElement(McpTab),
+      }), 'hermit-status:mcp-tab')
+      ctx.effect(() => ctx.betterSidebar.registerTab({
+        id: 'hermit:cli', title: 'CLI', icon: '💻', order: 64, single: true,
+        component: () => React.createElement(CliTab),
+      }), 'hermit-status:cli-tab')
     }
 
     exports.inject = inject

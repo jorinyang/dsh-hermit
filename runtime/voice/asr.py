@@ -75,6 +75,7 @@ class AsrPipeline:
         self._had_partial = False
         self._last_partial = ""
         self._ep_emitted = False   # 语义模式：本轮是否已发声学端点 cue
+        self._ep_text = ""         # 声学端点 cue 时的文本快照（force_final 兜底用）
         self.stream = self.recognizer.create_stream()
 
     def set_acoustic_ms(self, ms: int):
@@ -101,6 +102,8 @@ class AsrPipeline:
 
         text = self.recognizer.get_result(self.stream) or ""
         ev = None
+        if text:
+            self._ep_text = text.strip()   # 始终同步最新文本快照（extend 后继续说的文本也能兜底）
         if text and not self._had_partial:
             self._had_partial = True
             ev = {"type": "start"}
@@ -113,7 +116,11 @@ class AsrPipeline:
                 # 声学端点 cue：保持（不 finalize），等 DSH 语义复判（endpoint.accept/extend）或超时
                 if not self._ep_emitted:
                     self._ep_emitted = True
-                    return {"type": "endpoint_acoustic", "text": text.strip(), "pause_ms": self.acoustic_ms}
+                    if self._ep_text:
+                        return {"type": "endpoint_acoustic", "text": self._ep_text, "pause_ms": self.acoustic_ms}
+                    # 空文本端点（唤醒后尚未说话的静音误判）——静默复位，不发 cue
+                    self._new_turn()
+                    return None
                 return ev
             final = (self.recognizer.get_result(self.stream) or "").strip()
             ms = self.speech_ms
@@ -126,6 +133,9 @@ class AsrPipeline:
         while self.recognizer.is_ready(self.stream):
             self.recognizer.decode_stream(self.stream)
         text = (self.recognizer.get_result(self.stream) or "").strip()
+        # 兜底：声学端点后 stream 继续吃静音块，get_result 可能已变空——用端点时刻的快照
+        if not text and self._ep_text:
+            text = self._ep_text
         if not text:
             self._new_turn()
             return None
@@ -135,3 +145,7 @@ class AsrPipeline:
 
     def reset(self):
         self._new_turn()
+
+    def current_text(self):
+        """当前累积的转写文本（供 ASR 唤醒词检测用，不重置 stream）。"""
+        return self._last_partial

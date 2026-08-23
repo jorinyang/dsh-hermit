@@ -1,4 +1,4 @@
-# start-voice.ps1 — 启动 Hermit 语音引擎进程（26 契约 C；仿 start-brain.ps1 模式：模型进程外置）
+﻿# start-voice.ps1 — 启动 Hermit 语音引擎进程（26 契约 C；仿 start-brain.ps1 模式：模型进程外置）
 # 双平台铁律：Win 本脚本；Mac/Linux 用 start-voice.sh（D2 起提供）。仅绑定回环。
 param(
   [int]$Port = 8300,

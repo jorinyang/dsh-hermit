@@ -2,13 +2,13 @@
 # hermit-executors 通过 HTTP 调用；显存调度（03 §4.4）由 SHC/HealthService 管理（MVP-1+）
 server:
   base_url: "http://127.0.0.1:8080/v1"   # 仅绑定回环（03 §7.1）
-  runtime: llama.cpp                       # Vulkan 构建 b10488（CUDA-13.3 为性能升级位）
+  runtime: llama.cpp                       # Vulkan 构建 b10488；仅 GPU 锁定（--device Vulkan0，见 start-brain.ps1）；CUDA-13.3 为性能升级位
   openai_compatible: true
 models:
-  brain:                                   # R0/R2 大脑（MVP-0 先用云端，本地为隐私兜底）
-    file: models/Qwen3-8B-Q6_K.gguf
+  brain:                                   # R0/R2 大脑（2026-08-23 切换：Qwen3-8B → Qwen3.5-9B，27 §四；Qwen3-8B 保留可回退）
+    file: models/Qwen3.5-9B-Q6_K.gguf
     role: brain
-    vram_gb: 6.26
+    vram_gb: 6.95
     ctx_size: 32768
   # 语音（M1-A D2/D3/D4 落地，26 §8.2）：sherpa-onnx 流式 paraformer int8（RTF≈0.08）
   # + KWS zipformer-wenetspeech-3.3M int8（唤醒）+ TTS kokoro-multi-lang（中文, lang=zh）
