@@ -22,6 +22,37 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
 
+/** 语音路径动作→拟声词（与 hermit-core/lib/voice.js 同一映射，保持单源——改这里记得同步那边）。
+ * UI 保留动作描写；TTS 合成前过滤。 */
+const ACTION_TO_SOUND = {
+  '\uFF08张开小嘴\uFF09': '\uFF08啊~\uFF09',
+  '\uFF08张开嘴\uFF09': '\uFF08啊~\uFF09',
+  '\uFF08小跑\uFF09': '\uFF08踏踏踏~~\uFF08脚步声\uFF09\uFF09',
+  '\uFF08跑来\uFF09': '\uFF08踏踏踏~~\uFF08脚步声\uFF09\uFF09',
+  '\uFF08跑过来\uFF09': '\uFF08踏踏踏~~\uFF08脚步声\uFF09\uFF09',
+  '\uFF08期待的眨眨眼\uFF09': '\uFF08嗯？\uFF08疑问声\uFF09\uFF09',
+  '\uFF08期待的眨眼\uFF09': '\uFF08嗯？\uFF08疑问声\uFF09\uFF09',
+  '\uFF08眨眨眼\uFF09': '\uFF08嗯？\uFF08疑问声\uFF09\uFF09',
+  '\uFF08认真点头\uFF09': '\uFF08嗯嗯\uFF09',
+  '\uFF08点头\uFF09': '\uFF08嗯嗯\uFF09',
+  '\uFF08抬头\uFF09': '\uFF08嗯~\uFF09',
+  '\uFF08小声\uFF09': '\uFF08嘘~\uFF09',
+  '\uFF08笑\uFF09': '\uFF08嘻嘻\uFF09',
+  '\uFF08笑出声\uFF09': '\uFF08嘻嘻~\uFF09',
+  '\uFF08拍拍手\uFF09': '\uFF08啪啪啪\uFF09',
+  '\uFF08摇头\uFF09': '\uFF08不不\uFF09',
+  '\uFF08挥手\uFF09': '\uFF08拜拜~\uFF09',
+}
+function toSpeechText(text) {
+  if (!text) return text
+  let out = text
+  for (const [action, sound] of Object.entries(ACTION_TO_SOUND)) {
+    if (out.includes(action)) out = out.split(action).join(sound)
+  }
+  return out
+}
+
+
 export const name = 'hermit-voice'
 export const inject = ['tools']
 
@@ -382,9 +413,10 @@ class VoiceService extends Service {
     const utterance_id = 'utt_' + randomUUID().slice(0, 8)
     if (!this.ready) return { utterance_id, delivered: false, reason: 'engine-down' }
     this.speakSentAt = Date.now()
-    this.pendingUtterance = { text, priority, source, started: false, tts_first_ms: null }
+    const speechText = toSpeechText(text) // TTS 前过滤动作描写（26 §A.4 语音路径）
+    this.pendingUtterance = { text: speechText, priority, source, started: false, tts_first_ms: null }
     const ok = this.send('tts.speak', {
-      utterance_id, text, priority, source,
+      utterance_id, text: speechText, priority, source,
       voice_preset: this.overlay.voice_preset ?? '官方预设',
       rate: this.overlay.rate ?? 1.0,
     })
