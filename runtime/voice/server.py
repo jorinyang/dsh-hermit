@@ -13,6 +13,7 @@ D2（2026-08-20）：真件 ASR 上线
 """
 import asyncio
 import json
+import re
 import signal
 import sys
 import threading
@@ -28,6 +29,7 @@ from asr import AsrPipeline  # noqa: E402
 from audio_source import MicSource, WavInjectSource, load_wav_16k  # noqa: E402
 from kws import KwsGate  # noqa: E402
 from tts import TtsEngine  # noqa: E402
+from qwen_tts import QwenTtsEngine  # noqa: E402
 
 PROTOCOL_VERSION = 1
 HERE = Path(__file__).resolve().parent
@@ -40,7 +42,17 @@ def load_config():
         "mic": {"enabled": True},
         "endpoint": {"acoustic_ms": 600, "semantic_wait_ms": 1200, "semantic_enabled": False},
         "wake": {"enabled": True, "engine": "sherpa-onnx", "keywords_file": "configs/kws-keywords.txt", "dialog_window_s": 30},
-        "tts": {"voice": "zf_xiaoni", "speed": 1.0},
+        "tts": {
+            "engine": "auto",  # qwen3(CUDA) | sherpa(CPU) | auto(qwen3→sherpa→fake) | fake
+            "voice": "zf_xiaoni", "speed": 1.0,
+            "qwen3": {
+                "exe": "runtime/qwentts.cpp/build/tts-server.exe",
+                "talker": "models/voice/qwen3-tts/qwen-talker-0.6b-base-Q8_0.gguf",
+                "codec": "models/voice/qwen3-tts/qwen-tokenizer-12hz-Q8_0.gguf",
+                "cuda_bin": "runtime/mamba/envs/cuda/Library/bin",
+                "host": "127.0.0.1", "port": 8310, "lang": "Chinese",
+            },
+        },
         "fake": {"asr_partial_ms": 90, "asr_final_ms": 220, "tts_first_ms": 90, "tts_per_char_ms": 40},
     }
     try:
@@ -62,6 +74,11 @@ def load_config():
         kf = cfg["wake"].get("keywords_file", "")
         if kf and not Path(kf).is_absolute():
             cfg["wake"]["keywords_file"] = str((root / kf).resolve())
+        q3 = cfg["tts"].get("qwen3", {})
+        for k in ("exe", "talker", "codec", "cuda_bin"):
+            v = q3.get(k, "")
+            if v and not Path(v).is_absolute():
+                q3[k] = str((root / v).resolve())
     except Exception as e:
         print(f"[voice-engine] config fallback: {e}", file=sys.stderr)
     return cfg
@@ -71,12 +88,21 @@ CFG = load_config()
 COUNTERS = {"connections": 0, "asr_finals": 0, "asr_reals": 0, "tts_finished": 0, "barge_ins": 0, "http_transcriptions": 0, "wake_fires": 0}
 ENGINE_STATE = {"state": "idle"}
 START = time.time()
-PIPELINE = {"asr": None, "mode": "fake", "mic_error": None, "mic_active": False}  # 全局单例：WS 会话与 HTTP 端点共用
+PIPELINE = {"asr": None, "mode": "fake", "mic_error": None, "mic_count": 0}  # 全局单例：WS 会话与 HTTP 端点共用（mic_count 引用计数，多连接不误判）
 KWS = {"gate": None, "enabled": False}  # 唤醒门控单例（D3）
-TTS = {"engine": None, "ready": False}  # TTS 引擎单例（D4）
+TTS = {"engine": None, "ready": False, "engine_name": "fake-tts"}  # TTS 引擎单例（D4）
 BARGIN = {"vad": None}  # barge-in 静音检测 VAD（silero，D4）
 ASR_LOCK = asyncio.Lock()
 LAST_ASR = {"text": "", "at": 0.0}
+# 引擎开关（HTTP 可控，跨连接持久）：麦克风静音 / 唤醒模式（voice语音|hotkey按键|off关闭=免唤醒持续对话）/ 摄像头开关
+TOGGLES = {"mic_muted": False, "wake_mode": "voice", "camera_enabled": False}
+ACTIVE = {"router": None, "conn": None}   # 当前 WS 连接（HTTP 开关要作用到它）
+LOOP = None   # 主 asyncio loop（HTTP TTS 播报在 loop 上调度 real_speak）
+
+# ASR 唤醒词模糊匹配：蓝牙麦把「寄」(jì) 糊成 鸡/气/系/机 等翘舌音，ASR 转写也跟着糊。
+# 用「小 + 翘舌音字」做宽松匹配（比 3.3M KWS 的精确 ppinyin 更鲁棒）。
+WAKE_JQX = "鸡机记纪技寄几其器期齐系西喜溪席"
+WAKE_RE = re.compile(f"小[{WAKE_JQX}]")
 
 # 实时电平（供 /level 端点 + 侧边栏波形可视化）：feeder 写、HTTP 线程读
 LEVEL_LOCK = threading.Lock()
@@ -117,7 +143,7 @@ class Conn:
 
     def __init__(self, ws):
         self.ws = ws
-        self.wake_armed = True
+        self.wake_mode = TOGGLES.get("wake_mode", "voice")
         self.dialog_until = 0.0
         self.speak_task = None
         self.current_utterance = None
@@ -176,8 +202,67 @@ def _play_blocking(samples, rate, conn):
             pass
 
 
+def split_zh_sentences(text: str) -> list:
+    """中文文本按句末标点切句（。！？；…）；过短碎片并入前句；无标点长句保持单句。"""
+    text = str(text or "").strip()
+    if not text:
+        return []
+    parts = re.split(r"(?<=[。！？；…])", text)
+    parts = [p.strip() for p in parts if p.strip()]
+    merged = []
+    for p in parts:
+        if merged and len(p) < 4 and not p[-1] in "。！？；…":
+            merged[-1] += p
+        else:
+            merged.append(p)
+    return merged
+
+
+def _play_sentences_streaming(conn, tts, sentences, first_samples, speed, chunk=1024):
+    """分句流式播报（executor 线程）：先播首句，后续句子边合成边续播；barge 可打断。
+    26 §A.4「流式续接」的引擎侧实现（v1 协议不变：speak 整发，引擎内部分句）。"""
+    rate = tts.sample_rate
+    stream = sd.OutputStream(samplerate=rate, channels=1, dtype="float32")
+    stream.start()
+    total = 0
+
+    def write_all(samples):
+        nonlocal total
+        pos = 0
+        while pos < len(samples):
+            if conn.barge_signal.is_set():
+                return False
+            end = min(pos + chunk, len(samples))
+            stream.write(samples[pos:end])
+            pos = end
+        total += len(samples)
+        return True
+
+    try:
+        if not write_all(first_samples):
+            return "barged", int(total / rate * 1000), time.time()
+        for sent in sentences[1:]:
+            if conn.barge_signal.is_set():
+                return "barged", int(total / rate * 1000), time.time()
+            samples = tts.synthesize(sent, speed)
+            if not write_all(samples):
+                return "barged", int(total / rate * 1000), time.time()
+        stream.stop()
+        stream.close()
+        return "done", int(total / rate * 1000), time.time()
+    finally:
+        try:
+            stream.stop()
+        except Exception:
+            pass
+        try:
+            stream.close()
+        except Exception:
+            pass
+
+
 async def real_speak(conn: Conn, p):
-    """真 TTS：合成（executor 线程）→ 播报（executor 线程，barge 可打断）→ tts.finished/stopped。"""
+    """真 TTS（分句流式）：按句末标点切句 → 首句合成完即报 started 并开播 → 后续逐句续播（barge 可打断）→ tts.finished。"""
     uid = p.get("utterance_id", "")
     text = str(p.get("text", ""))
     tts = TTS["engine"]
@@ -187,14 +272,17 @@ async def real_speak(conn: Conn, p):
     if BARGIN["vad"]:
         BARGIN["vad"].reset()
     try:
+        sentences = split_zh_sentences(text) or [text]
+        speed = float(p.get("rate", 1.0) or 1.0)
         t0 = time.time()
-        samples = await loop.run_in_executor(None, tts.synthesize, text, float(p.get("rate", 1.0) or 1.0))
+        first_samples = await loop.run_in_executor(None, tts.synthesize, sentences[0], speed)
         first_ms = int((time.time() - t0) * 1000)
         rate = tts.sample_rate
-        await conn.send("tts.started", {"utterance_id": uid, "first_packet_ms": first_ms})
+        await conn.send("tts.started", {"utterance_id": uid, "first_packet_ms": first_ms, "sentences": len(sentences)})
         await conn.emit_state("speaking", "tts-started")
         conn.speak_active = True
-        status, played_ms, stop_time = await loop.run_in_executor(None, _play_blocking, samples, rate, conn)
+        status, played_ms, stop_time = await loop.run_in_executor(
+            None, _play_sentences_streaming, conn, tts, sentences, first_samples, speed)
         conn.speak_active = False
         if status == "barged":
             COUNTERS["barge_ins"] += 1
@@ -279,19 +367,25 @@ class Router:
         self.injecting = False
         self.feeder_task = None
         self._ep_timer = None   # 语义端点保持定时器（endpoint.acoustic → accept/extend/超时）
+        # 每连接独立 KWS 门控（多实例/多会话各自一条 stream，避免共享 stream 音频交织导致唤醒失效）
+        self.kws = None
+        if KWS["enabled"]:
+            try:
+                self.kws = KwsGate(CFG["asr"]["models_dir"], CFG["wake"]["keywords_file"])
+            except Exception as e:
+                print(f"[voice-engine] WARN: per-conn KWS init failed: {e}", file=sys.stderr)
 
     async def start(self):
         if PIPELINE["mode"] != "real" or not PIPELINE["asr"]:
             return
-        if CFG["mic"]["enabled"]:
+        if CFG["mic"]["enabled"] and not TOGGLES.get("mic_muted", False):
             self.mic = MicSource(self.loop, self.audio_q, device=resolve_mic_device(), gain=CFG["mic"].get("gain", 1.0))
             if not self.mic.start():
                 PIPELINE["mic_error"] = self.mic.error
-                PIPELINE["mic_active"] = False
                 await self.conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风不可用：{self.mic.error}", "degrade_hint": "check_device"})
                 self.mic = None
             else:
-                PIPELINE["mic_active"] = True
+                PIPELINE["mic_count"] += 1
         self.feeder_task = asyncio.create_task(self.feeder())
         self.ticker_task = asyncio.create_task(self.window_ticker())
 
@@ -309,7 +403,7 @@ class Router:
         if self.mic:
             self.mic.stop()
             self.mic = None
-            PIPELINE["mic_active"] = False
+            PIPELINE["mic_count"] = max(0, PIPELINE["mic_count"] - 1)
         while not self.audio_q.empty():
             try:
                 self.audio_q.get_nowait()
@@ -363,6 +457,7 @@ class Router:
                     COUNTERS["asr_finals"] += 1
                     COUNTERS["asr_reals"] += 1
                     LAST_ASR.update(text=p["text"], at=time.time())
+                    print(f"[voice-engine] ASR final: 「{p['text']}」", file=sys.stderr)
 
     def accept_endpoint(self):
         """DSH 语义复判「说完了」→ 立即 finalize。"""
@@ -375,27 +470,33 @@ class Router:
         self._start_ep_timer()
 
     def _gate_enabled(self) -> bool:
-        return bool(KWS["enabled"] and KWS["gate"] and PIPELINE["asr"])
+        return bool(KWS["enabled"] and self.kws and PIPELINE["asr"])
 
     def _feed_block(self, block):
-        """音频帧路由（26 §C.3）：idle 只过 KWS 门；唤醒/免唤醒窗/对话态 → ASR 直通。"""
+        """音频帧路由（唤醒三态）：voice=语音唤醒检测 / hotkey=只等快捷键 / off=免唤醒持续对话。"""
         now = time.time()
         in_window = now < self.conn.dialog_until
         frames = []
-        gate = self._gate_enabled()
-        if not gate or not self.conn.wake_armed or in_window or ENGINE_STATE["state"] == "listening":
-            # KWS 未启用 / 主人关闭唤醒(全开档) / 窗内 / 对话态：ASR 直通
+        mode = self.conn.wake_mode
+        if mode == "hotkey" and not in_window and ENGINE_STATE["state"] != "listening":
+            # 按键唤醒：idle 态丢弃音频，只等右 Shift 快捷键触发唤醒
+            return frames
+        if mode == "off" or in_window or ENGINE_STATE["state"] == "listening":
+            # 关闭唤醒（免唤醒持续对话，接收所有信息）/ 窗内 / 对话态：ASR 直通
             frames.extend(self._pipeline_event_frames(PIPELINE["asr"].feed(block)))
         else:
-            ev = KWS["gate"].feed(block)
-            if ev:
+            # 语音唤醒：ASR 唤醒词检测（蓝牙麦糊「寄」音，用 paraformer 宽松匹配「小+翘舌音」）
+            PIPELINE["asr"].feed(block)
+            text = PIPELINE["asr"].current_text()
+            m = WAKE_RE.search(text) if text else None
+            if m:
                 COUNTERS["wake_fires"] += 1
                 self.conn.dialog_until = now + CFG["wake"]["dialog_window_s"]
                 ENGINE_STATE["state"] = "listening"
-                frames.append(("wake.detected", {"keyword": ev["keyword"], "confidence": None}))
-                frames.append(("state", {"from": "idle", "to": "listening", "reason": "wake"}))
-                # 当前块尾音可能带指令开头（「小寄小寄，今天……」）——同时喂 ASR，不漏字
-                frames.extend(self._pipeline_event_frames(PIPELINE["asr"].feed(block)))
+                frames.append(("wake.detected", {"keyword": m.group(0), "confidence": None}))
+                frames.append(("state", {"from": "idle", "to": "listening", "reason": "asr-wake"}))
+                # 唤醒命中：丢弃已累积的唤醒词文本，指令从下一块开始识别（连读会漏首字，但转写干净）
+                PIPELINE["asr"].reset()
         return frames
 
     def _barge_feed(self, block):
@@ -419,6 +520,10 @@ class Router:
         """麦克风帧 → 路由（speaking 期只喂 barge VAD；注入期间暂停消费，避免混音）。"""
         hist_acc = 0.0
         hist_n = 0
+        diag_acc = 0.0
+        diag_n = 0
+        diag_peak = 0.0
+        diag_t = time.time()
         while True:
             if self.injecting:
                 await asyncio.sleep(0.02)
@@ -429,12 +534,27 @@ class Router:
                 continue
             # 实时电平：每 ~100ms（3 个 32ms block）推一个点给 /level 波形可视化
             f = block.astype(np.float32) / 32768.0
-            hist_acc += float(np.mean(f ** 2))
+            rms = float(np.mean(f ** 2))
+            hist_acc += rms
             hist_n += 1
             if hist_n >= 3:
                 _push_level((hist_acc / hist_n) ** 0.5)
                 hist_acc = 0.0
                 hist_n = 0
+            # 诊断：1s 聚合（RMS/峰值）+ 响块即时告警（定位「声音到没到 KWS 门」）
+            diag_acc += rms
+            diag_n += 1
+            diag_peak = max(diag_peak, float(np.max(np.abs(f))))
+            rms_now = rms ** 0.5
+            if rms_now >= 0.01:
+                in_window = time.time() < self.conn.dialog_until
+                print(f"[voice-engine] LOUD rms={rms_now:.4f} state={ENGINE_STATE['state']} mode={self.conn.wake_mode} window={in_window}", file=sys.stderr, flush=True)
+            if time.time() - diag_t >= 1.0:
+                print(f"[voice-engine] DIAG 1s rms={(diag_acc / max(diag_n, 1)) ** 0.5:.5f} peak={diag_peak:.4f} state={ENGINE_STATE['state']} mode={self.conn.wake_mode} qsize={self.audio_q.qsize()}", file=sys.stderr, flush=True)
+                diag_acc = 0.0
+                diag_n = 0
+                diag_peak = 0.0
+                diag_t = time.time()
             if self.conn.speak_active and BARGIN["vad"]:
                 self._barge_feed(block)
                 continue
@@ -447,6 +567,10 @@ class Router:
                     print(f"[voice-engine] ASR final: 「{p['text']}」", file=sys.stderr)
                 elif t == "wake.detected":
                     print(f"[voice-engine] WAKE: {p.get('keyword')}", file=sys.stderr)
+                elif t == "asr.partial":
+                    print(f"[voice-engine] ASR partial: 「{p.get('text')}」", file=sys.stderr)
+                elif t == "endpoint.acoustic":
+                    print(f"[voice-engine] ENDPOINT cue: 「{p.get('text')}」 pause={p.get('pause_ms')}ms", file=sys.stderr)
 
     async def window_ticker(self):
         """免唤醒窗到期巡检：listening 且窗过期 → 回 idle（12 §五.2 窗口语义）。"""
@@ -523,12 +647,46 @@ async def handler(ws):
 
     conn.status_task = asyncio.create_task(status_loop())
     try:
-        # 先启动麦克风/路由，再上报 engine.ready，否则 mic 字段永远是 off（时序 bug）
+        # 先握手 + 白名单检查，通过后才开麦（避免 53551 等非 4080 实例反复开麦抢设备/刷日志）
+        try:
+            raw = await asyncio.wait_for(ws.recv(), timeout=15)
+        except asyncio.TimeoutError:
+            await ws.close(code=1008)
+            return
+        try:
+            hello = json.loads(raw)
+        except Exception:
+            await ws.close(code=1008)
+            return
+        home = str((hello.get("payload") or {}).get("home", ""))
+        if hello.get("type") != "session.hello" or "dsh-hermit" not in home:
+            # 非 4080 实例（如 53551 桌面的 hermit 预设）→ 待机而非拒绝：
+            # 接受连接但不登记 ACTIVE、不开麦，避免客户端无限重连刷日志。
+            print(f"[voice-engine] STANDBY non-hermit connection (home={home or '未标识'})", file=sys.stderr)
+            await conn.send("engine.ready", {
+                "models": [], "device": "standby", "asr_mode": "fake",
+                "kws": "off", "tts": "off", "barge_vad": "off", "mic": "off",
+                "standby": True,
+            })
+            try:
+                async for raw in ws:
+                    try:
+                        msg = json.loads(raw)
+                    except Exception:
+                        continue
+                    if msg.get("type") == "ping":
+                        await conn.send("pong", {"t": (msg.get("payload") or {}).get("t")}, _id=msg.get("id"))
+            except Exception:
+                pass
+            return
+        # 白名单通过 → 登记 ACTIVE 供 HTTP 开关作用，再开麦 + 上报 engine.ready
+        ACTIVE["router"] = router
+        ACTIVE["conn"] = conn
         await router.start()
         await conn.send("engine.ready", {
             "models": (["funasr-streaming-paraformer-zh-en"] if PIPELINE["mode"] == "real" else [])
                 + (["kws-zipformer-wenetspeech-3.3M"] if KWS["enabled"] else [])
-                + (["kokoro-multi-lang-v1_0"] if TTS["ready"] else ["fake-tts"]),
+                + ([TTS["engine_name"]] if TTS["ready"] else ["fake-tts"]),
             "device": "cpu" if PIPELINE["mode"] == "real" else "skeleton",
             "asr_mode": PIPELINE["mode"],
             "kws": "on" if KWS["enabled"] else "off",
@@ -550,12 +708,17 @@ async def handler(ws):
                 continue
             mtype, mid, p = msg.get("type"), msg.get("id"), msg.get("payload") or {}
             if mtype == "session.hello":
-                if msg.get("v") != PROTOCOL_VERSION:
-                    await conn.send("engine.error", {"code": "E_PROTOCOL", "message": f"protocol v{msg.get('v')} != v{PROTOCOL_VERSION}", "degrade_hint": "restart_engine"}, _id=mid)
+                # 已在握手阶段处理过，重复 hello 忽略
+                pass
             elif mtype == "ping":
                 await conn.send("pong", {"t": p.get("t")}, _id=mid)
             elif mtype == "wake.set":
-                conn.wake_armed = bool(p.get("armed", True))
+                mode = p.get("mode")
+                if mode in ("voice", "hotkey", "off"):
+                    conn.wake_mode = mode
+                    TOGGLES["wake_mode"] = mode
+                else:
+                    conn.wake_mode = "voice" if p.get("armed", True) else "off"
             elif mtype == "dialog_window.open":
                 conn.dialog_until = time.time() + (p.get("ms", 30000) / 1000)
             elif mtype == "endpoint.set":
@@ -579,15 +742,14 @@ async def handler(ws):
             elif mtype == "mic.set":
                 if PIPELINE["mode"] == "real":
                     if p.get("muted") and router.mic:
-                        router.mic.stop(); router.mic = None; PIPELINE["mic_active"] = False
+                        router.mic.stop(); router.mic = None; PIPELINE["mic_count"] = max(0, PIPELINE["mic_count"] - 1)
                     elif not p.get("muted") and not router.mic:
                         router.mic = MicSource(router.loop, router.audio_q, device=resolve_mic_device(), gain=CFG["mic"].get("gain", 1.0))
                         if not router.mic.start():
-                            PIPELINE["mic_active"] = False
                             await conn.send("engine.error", {"code": "E_MIC_BUSY", "message": f"麦克风恢复失败：{router.mic.error}", "degrade_hint": "check_device"})
                             router.mic = None
                         else:
-                            PIPELINE["mic_active"] = True
+                            PIPELINE["mic_count"] += 1
             elif mtype == "asr.context":
                 if p.get("hotwords"):
                     # 流式 paraformer 不吃热词（26 §8 决策点 3 挂起）；收下并如实记录
@@ -599,7 +761,7 @@ async def handler(ws):
                 asyncio.get_running_loop().stop()
                 return
             elif mtype == "debug.inject_wake" and CFG["debug"]:
-                if conn.wake_armed:
+                if conn.wake_mode != "off":
                     await conn.send("wake.detected", {"keyword": p.get("keyword", "小寄小寄"), "confidence": 0.95})
                     conn.dialog_until = time.time() + 30
             elif mtype == "debug.inject_asr" and CFG["debug"]:
@@ -626,6 +788,9 @@ async def handler(ws):
         if conn.speak_task:
             conn.speak_task.cancel()
         ENGINE_STATE["state"] = "idle"
+        if ACTIVE["router"] is router:
+            ACTIVE["router"] = None
+            ACTIVE["conn"] = None
         print("[voice-engine] DSH disconnected; devices released, waiting for reconnect", file=sys.stderr)
 
 
@@ -658,6 +823,114 @@ def one_shot_transcribe(wav_bytes: bytes) -> dict:
             except OSError: pass
 
 
+def _set_mic_muted(muted: bool):
+    """HTTP 开关：静音/恢复麦克风（作用于当前 WS 连接的 router）。"""
+    TOGGLES["mic_muted"] = bool(muted)
+    router = ACTIVE["router"]
+    if router is None:
+        return
+    if muted and router.mic:
+        router.mic.stop()
+        router.mic = None
+        PIPELINE["mic_count"] = max(0, PIPELINE["mic_count"] - 1)
+        print("[voice-engine] mic muted (via HTTP)", file=sys.stderr, flush=True)
+    elif not muted and not router.mic:
+        router.mic = MicSource(router.loop, router.audio_q, device=resolve_mic_device(), gain=CFG["mic"].get("gain", 1.0))
+        if router.mic.start():
+            PIPELINE["mic_count"] += 1
+            print("[voice-engine] mic unmuted (via HTTP)", file=sys.stderr, flush=True)
+        else:
+            PIPELINE["mic_error"] = router.mic.error
+            router.mic = None
+
+
+def _set_wake_mode(mode: str):
+    """HTTP 开关：唤醒模式三态 voice(语音) / hotkey(按键) / off(关闭=免唤醒持续对话)。"""
+    mode = mode if mode in ("voice", "hotkey", "off") else "voice"
+    TOGGLES["wake_mode"] = mode
+    if ACTIVE["conn"] is not None:
+        ACTIVE["conn"].wake_mode = mode
+    print(f"[voice-engine] wake_mode={mode} (via HTTP)", file=sys.stderr, flush=True)
+
+
+def _set_camera_enabled(enabled: bool):
+    """HTTP 开关：摄像头开关（MVP-2 占位，暂无真实摄像头，仅持久化状态）。"""
+    TOGGLES["camera_enabled"] = bool(enabled)
+    print(f"[voice-engine] camera enabled={bool(enabled)} (via HTTP)", file=sys.stderr, flush=True)
+
+
+def _trigger_wake(keyword: str = "快捷键"):
+    """HTTP 唤醒快捷键：触发一次唤醒（开窗 + 状态 listening + 发 wake.detected），作用于 ACTIVE 连接。
+    全部动作调度到主 loop（ASR 非线程安全，避免与 feeder 竞态）。"""
+    conn = ACTIVE["conn"]
+    loop = LOOP
+    if conn is None or loop is None or loop.is_closed():
+        return {"ok": False, "error": "no active connection"}
+
+    def _schedule():
+        async def _do():
+            COUNTERS["wake_fires"] += 1
+            conn.dialog_until = time.time() + CFG["wake"]["dialog_window_s"]
+            ENGINE_STATE["state"] = "listening"
+            if PIPELINE["asr"]:
+                PIPELINE["asr"].reset()
+            await conn.send("wake.detected", {"keyword": keyword, "confidence": None})
+            await conn.send("state", {"from": "idle", "to": "listening", "reason": "hotkey"})
+            print(f"[voice-engine] WAKE (hotkey): {keyword}", file=sys.stderr, flush=True)
+        asyncio.ensure_future(_do())
+
+    loop.call_soon_threadsafe(_schedule)
+    return {"ok": True}
+
+
+def _http_tts_speak(payload: dict) -> dict:
+    """HTTP 触发 TTS 播报：在主 loop 上对 ACTIVE 连接调度 real_speak（供 host 侧 voiceBridge 跨 realm 发声）。"""
+    conn = ACTIVE["conn"]
+    loop = LOOP
+    if conn is None:
+        return {"ok": False, "error": "no active connection"}
+    if not TTS["ready"]:
+        return {"ok": False, "error": "tts not ready"}
+    if loop is None or loop.is_closed():
+        return {"ok": False, "error": "loop not ready"}
+
+    text = str(payload.get("text", "")).strip()
+    if not text:
+        return {"ok": False, "error": "empty text"}
+
+    async def _schedule():
+        if conn.speak_task:
+            conn.speak_task.cancel()
+            await asyncio.sleep(0)
+        p = {
+            "utterance_id": str(payload.get("utterance_id", "http_tts")),
+            "text": text,
+            "priority": str(payload.get("priority", "normal")),
+            "source": str(payload.get("source", "arbiter")),
+            "voice_preset": str(payload.get("voice_preset", CFG["tts"].get("voice", "zf_xiaoni"))),
+            "rate": float(payload.get("rate", 1.0) or 1.0),
+        }
+        conn.speak_task = asyncio.create_task(real_speak(conn, p))
+
+    loop.call_soon_threadsafe(lambda: asyncio.ensure_future(_schedule()))
+    return {"ok": True}
+
+
+def _http_tts_stop(_payload: dict) -> dict:
+    """HTTP 停止 TTS：取消 ACTIVE 连接正在进行的播报。"""
+    conn = ACTIVE["conn"]
+    loop = LOOP
+    if conn is None or loop is None or loop.is_closed():
+        return {"ok": False, "error": "no active connection"}
+
+    def _cancel():
+        if conn.speak_task:
+            conn.speak_task.cancel()
+
+    loop.call_soon_threadsafe(_cancel)
+    return {"ok": True}
+
+
 class HttpApi(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -677,7 +950,7 @@ class HttpApi(BaseHTTPRequestHandler):
                 "asr_mode": PIPELINE["mode"],
                 "uptime_s": int(time.time() - START),
                 "modules": {
-                    "mic": "ok" if PIPELINE["mic_active"] else (PIPELINE["mic_error"] or "off"),
+                    "mic": "ok" if PIPELINE["mic_count"] > 0 else (PIPELINE["mic_error"] or "off"),
                     "kws": "on" if KWS["enabled"] else "off",
                     "asr": PIPELINE["mode"],
                     "tts": "on" if TTS["ready"] else "off",
@@ -688,11 +961,12 @@ class HttpApi(BaseHTTPRequestHandler):
                      "status": "ok" if PIPELINE["mode"] == "real" else "fake"},
                     {"kind": "kws", "name": "kws-zipformer-wenetspeech-3.3M",
                      "status": "ok" if KWS["enabled"] else "off"},
-                    {"kind": "tts", "name": "kokoro-multi-lang-v1_0",
+                    {"kind": "tts", "name": TTS["engine_name"],
                      "status": "ok" if TTS["ready"] else "fake"},
                     {"kind": "vad", "name": "silero-vad",
                      "status": "ok" if BARGIN.get("vad") else "off"},
                 ],
+                "toggles": {"mic_muted": TOGGLES["mic_muted"], "wake_mode": TOGGLES["wake_mode"], "camera_enabled": TOGGLES["camera_enabled"]},
             })
         elif self.path == "/metrics":
             lines = [f"voice_{k} {v}" for k, v in COUNTERS.items()] + [f'voice_state{{s="{ENGINE_STATE["state"]}"}} 1']
@@ -704,7 +978,7 @@ class HttpApi(BaseHTTPRequestHandler):
                 levels = [round(rms, 6) for _ts, rms in LEVEL_HISTORY]
                 peak = round(LEVEL_PEAK["value"], 6)
                 speaking = bool(levels) and levels[-1] >= 0.005
-            self._json(200, {"ok": True, "levels": levels, "peak": peak, "speaking": speaking, "mic_active": PIPELINE["mic_active"]})
+            self._json(200, {"ok": True, "levels": levels, "peak": peak, "speaking": speaking, "mic_active": PIPELINE["mic_count"] > 0})
         else:
             self._json(404, {"error": "not found"})
 
@@ -717,6 +991,37 @@ class HttpApi(BaseHTTPRequestHandler):
             COUNTERS["http_transcriptions"] += 1
             result = one_shot_transcribe(wav_bytes)
             return self._json(503 if result.get("error", {}).get("code") == 503 else 200, result)
+        if self.path in ("/engine/mic", "/engine/wake", "/engine/camera"):
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            if self.path == "/engine/mic":
+                _set_mic_muted(not bool(body.get("on", True)))
+                return self._json(200, {"ok": True, "mic_muted": TOGGLES["mic_muted"]})
+            if self.path == "/engine/wake":
+                _set_wake_mode(str(body.get("mode", "voice")))
+                return self._json(200, {"ok": True, "wake_mode": TOGGLES["wake_mode"]})
+            _set_camera_enabled(bool(body.get("on", True)))
+            return self._json(200, {"ok": True, "camera_enabled": TOGGLES["camera_enabled"]})
+        if self.path == "/engine/trigger_wake":
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            r = _trigger_wake(str(body.get("keyword", "快捷键")))
+            return self._json(200, r)
+        if self.path in ("/engine/tts", "/engine/tts/stop"):
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            if self.path == "/engine/tts":
+                return self._json(200, _http_tts_speak(body))
+            return self._json(200, _http_tts_stop(body))
         return self._json(404, {"error": "not found"})
 
     def log_message(self, *a):
@@ -739,15 +1044,46 @@ def init_kws():
 
 
 def init_tts():
-    """真件 TTS（D4，kokoro）。缺件降级 fake-tts，WARN 不静默。"""
-    try:
-        TTS["engine"] = TtsEngine(CFG["asr"]["models_dir"], voice=CFG["tts"].get("voice", "zf_xiaoni"))
-        TTS["ready"] = True
-        print(f"[voice-engine] TTS ready: kokoro-multi-lang (cpu) voice={TTS['engine'].voice} sid={TTS['engine'].sid}", file=sys.stderr)
-    except Exception as e:
-        TTS["engine"] = None
-        TTS["ready"] = False
-        print(f"[voice-engine] WARN: TTS unavailable ({e}); falling back to fake-tts", file=sys.stderr)
+    """真件 TTS：Qwen3-TTS(CUDA) → sherpa vits-melo/kokoro(CPU) → fake 三级降级。"""
+    sel = CFG["tts"].get("engine", "auto")
+
+    # 1) Qwen3-TTS（CUDA，tts-server 子进程常驻 GPU）
+    if sel in ("auto", "qwen3"):
+        try:
+            q = CFG["tts"].get("qwen3", {})
+            TTS["engine"] = QwenTtsEngine(
+                q["exe"], q["talker"], q["codec"],
+                cuda_bin=q.get("cuda_bin"), host=q.get("host", "127.0.0.1"),
+                port=q.get("port", 8310), lang=q.get("lang", "Chinese"))
+            TTS["ready"] = True
+            TTS["engine_name"] = "qwen3-tts-0.6b"
+            print(f"[voice-engine] TTS ready: qwen3-tts-0.6b (cuda) via tts-server :{q.get('port', 8310)}", file=sys.stderr)
+            return
+        except Exception as e:
+            if sel == "qwen3":
+                TTS["engine"] = None
+                TTS["ready"] = False
+                TTS["engine_name"] = "fake-tts"
+                print(f"[voice-engine] WARN: qwen3 TTS unavailable ({e}); falling back to fake-tts", file=sys.stderr)
+                return
+            print(f"[voice-engine] WARN: qwen3 TTS unavailable ({e}); falling back to sherpa cpu", file=sys.stderr)
+
+    # 2) sherpa vits-melo / kokoro（CPU 兜底）
+    if sel in ("auto", "sherpa"):
+        try:
+            TTS["engine"] = TtsEngine(CFG["asr"]["models_dir"], voice=CFG["tts"].get("voice", "zf_xiaoni"))
+            TTS["ready"] = True
+            TTS["engine_name"] = "vits-melo-tts-zh_en" if getattr(TTS["engine"], "engine", "") == "vits" else "kokoro-multi-lang-v1_0"
+            print(f"[voice-engine] TTS ready: {TTS['engine_name']} (cpu) voice={TTS['engine'].voice} sid={TTS['engine'].sid}", file=sys.stderr)
+            return
+        except Exception as e:
+            print(f"[voice-engine] WARN: sherpa TTS unavailable ({e}); falling back to fake-tts", file=sys.stderr)
+
+    # 3) fake（真件全部缺件）
+    TTS["engine"] = None
+    TTS["ready"] = False
+    TTS["engine_name"] = "fake-tts"
+    print("[voice-engine] WARN: no TTS available; falling back to fake-tts", file=sys.stderr)
 
 
 def init_barge():
@@ -791,7 +1127,9 @@ def init_pipeline():
 
 
 async def main():
+    global LOOP
     port, hport = CFG["port"], CFG["healthz_port"]
+    LOOP = asyncio.get_running_loop()
     init_pipeline()
     if PIPELINE["mode"] == "real":
         init_kws()
